@@ -1,0 +1,68 @@
+2026-02-18 00:10:04,638 - INFO - Using device: cuda
+2026-02-18 00:10:07,811 - INFO - Chronos-2 model loaded.
+2026-02-18 00:10:07,811 - INFO - Number of time series: 26
+2026-02-18 00:10:07,811 - INFO - 
+Processing: MSL_C-1
+2026-02-18 00:12:36,876 - INFO - Using device: cuda
+2026-02-18 00:12:39,885 - INFO - Chronos-2 model loaded.
+2026-02-18 00:12:39,885 - INFO - Number of time series: 26
+2026-02-18 00:12:39,885 - INFO - 
+Processing: MSL_C-1
+2026-02-18 00:13:40,218 - INFO - Using device: cuda
+2026-02-18 00:13:43,388 - INFO - Chronos-2 model loaded.
+2026-02-18 00:13:43,388 - INFO - Number of time series: 26
+2026-02-18 00:13:43,388 - INFO - 
+Processing: MSL_C-1
+2026-02-18 00:13:55,874 - INFO - Using device: cuda
+2026-02-18 00:13:58,855 - INFO - Chronos-2 model loaded.
+2026-02-18 00:13:58,855 - INFO - Number of time series: 26
+2026-02-18 00:13:58,855 - INFO - 
+Processing: MSL_C-1
+2026-02-18 00:14:23,497 - INFO - Using device: cuda
+2026-02-18 00:14:26,509 - INFO - Chronos-2 model loaded.
+2026-02-18 00:14:26,509 - INFO - Number of time series: 26
+2026-02-18 00:14:26,509 - INFO - 
+Processing: MSL_C-1
+2026-02-18 00:25:32,257 - INFO - Using device: cuda
+2026-02-18 00:25:35,397 - INFO - Chronos-2 model loaded.
+2026-02-18 00:25:35,398 - INFO - Number of time series: 26
+2026-02-18 00:25:35,398 - INFO - 
+Processing: MSL_C-1
+2026-02-18 00:28:57,393 - INFO - AUROC: 0.6243, AUPRC: 0.2590, Best Threshold: 0.000744
+2026-02-18 00:28:57,690 - INFO - 
+Processing: MSL_C-2
+2026-02-18 00:32:10,070 - INFO - Using device: cuda
+2026-02-18 00:32:13,294 - INFO - Chronos-2 model loaded.
+2026-02-18 00:32:13,294 - INFO - Number of time series: 26
+2026-02-18 00:32:13,294 - INFO - 
+Processing: MSL_C-1
+2026-02-18 00:33:05,078 - INFO - Using device: cuda
+2026-02-18 00:33:08,258 - INFO - Chronos-2 model loaded.
+2026-02-18 00:33:08,258 - INFO - Number of time series: 26
+2026-02-18 00:33:08,258 - INFO - 
+Processing: MSL_C-1
+2026-02-18 00:36:30,247 - INFO - AUROC: 0.6099, AUPRC: 0.2181, Best Threshold: 0.000571
+2026-02-18 00:36:30,545 - INFO - 
+Processing: MSL_C-2
+2026-02-18 00:39:29,155 - INFO - AUROC: 0.6734, AUPRC: 0.1090, Best Threshold: 0.000003
+2026-02-18 00:39:29,296 - INFO - 
+Processing: MSL_D-14
+2026-02-18 00:41:15,467 - INFO - Using device: cuda
+2026-02-18 00:41:19,136 - INFO - Chronos-2 model loaded.
+2026-02-18 00:41:19,136 - INFO - Number of time series: 26
+2026-02-18 00:41:19,136 - INFO - 
+Processing: MSL_C-1
+2026-02-18 00:44:41,203 - INFO - AUROC: 0.6099, AUPRC: 0.2181, Best Threshold: 0.000571
+2026-02-18 00:44:41,517 - INFO - 
+Processing: MSL_C-2
+2026-02-18 00:47:40,124 - INFO - AUROC: 0.6734, AUPRC: 0.1090, Best Threshold: 0.000003
+2026-02-18 00:47:40,266 - INFO - 
+Processing: MSL_D-14
+2026-02-18 00:55:00,157 - INFO - Using device: cuda
+2026-02-18 00:55:03,799 - INFO - Chronos-2 model loaded.
+2026-02-18 00:55:03,799 - INFO - Number of time series: 26
+2026-02-18 00:55:03,799 - INFO - 
+Processing: MSL_C-1
+2026-02-18 00:58:40,124 - INFO - AUROC: 0.6099, AUPRC: 0.2181, Best Threshold: 0.000571
+2026-02-18 00:58:40,439 - INFO - 
+Processing: MSL_C-2

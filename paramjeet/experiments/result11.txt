@@ -1,0 +1,18 @@
+=== Raw data ===
+Train shape: (2050, 22)
+Test shape : (8200, 22)
+Columns: 22
+
+=== After preprocessing ===
+X_train: (2050, 18)
+X_test : (8200, 18)
+Anomaly ratio (test): 0.6376829268292683
+
+Loading TimeFM model...
+Downloaded.
+ TimeFM model loaded and compiled.
+
+Computing anomaly scores using TimeFM...
+
+Running TimeFM on 18 features...
+  Feature 1/18

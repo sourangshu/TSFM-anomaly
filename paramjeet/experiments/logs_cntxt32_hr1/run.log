@@ -1,0 +1,57 @@
+2026-03-03 00:27:37,585 - INFO - Loading TimeFM model...
+2026-03-03 00:27:38,358 - INFO - Downloading checkpoint from Hugging Face repo google/timesfm-2.5-200m-pytorch
+2026-03-03 00:27:38,620 - INFO - Loading checkpoint from: /home/paramjeet/.cache/huggingface/hub/models--google--timesfm-2.5-200m-pytorch/snapshots/1d952420fba87f3c6dee4f240de0f1a0fbc790e3/model.safetensors
+2026-03-03 00:27:39,017 - INFO - When compiling, max horizon needs to be multiple of the output patch size 128. Using max horizon = 128 instead.
+2026-03-03 00:27:39,017 - INFO - Model ready.
+
+2026-03-03 00:27:39,017 - INFO - Number of time series:31
+2026-03-03 00:27:39,017 - INFO - 
+Processing: Exathlon_10_2_1000000_67
+2026-03-03 02:32:35,744 - INFO - AUROC: 0.8179
+2026-03-03 02:32:35,745 - INFO - Best Threshold: 0.000001
+2026-03-03 02:32:35,745 - INFO - Best TPR: 0.9531
+2026-03-03 02:32:35,745 - INFO - Best FPR: 0.3787
+2026-03-03 02:32:35,832 - INFO - 
+Processing: Exathlon_10_3_1000000_75
+2026-03-03 13:07:40,025 - INFO - AUROC: 0.4814
+2026-03-03 13:07:40,025 - INFO - Best Threshold: 0.000168
+2026-03-03 13:07:40,025 - INFO - Best TPR: 0.9743
+2026-03-03 13:07:40,025 - INFO - Best FPR: 0.9695
+2026-03-03 13:07:40,129 - INFO - 
+Processing: Exathlon_10_4_1000000_79
+2026-03-03 22:53:40,640 - INFO - AUROC: 0.5109
+2026-03-03 22:53:40,640 - INFO - Best Threshold: 0.005539
+2026-03-03 22:53:40,640 - INFO - Best TPR: 0.9340
+2026-03-03 22:53:40,640 - INFO - Best FPR: 0.8760
+2026-03-03 22:53:40,744 - INFO - 
+Processing: Exathlon_1_2_100000_68
+2026-03-03 23:33:10,725 - INFO - AUROC: 0.2012
+2026-03-03 23:33:10,725 - INFO - Best Threshold: 0.000020
+2026-03-03 23:33:10,725 - INFO - Best TPR: 0.0696
+2026-03-03 23:33:10,725 - INFO - Best FPR: 0.0000
+2026-03-03 23:33:10,786 - INFO - 
+Processing: Exathlon_1_4_1000000_80
+2026-03-04 09:19:46,203 - INFO - AUROC: 0.5220
+2026-03-04 09:19:46,203 - INFO - Best Threshold: 0.005585
+2026-03-04 09:19:46,203 - INFO - Best TPR: 0.4552
+2026-03-04 09:19:46,203 - INFO - Best FPR: 0.4132
+2026-03-04 09:19:46,308 - INFO - 
+Processing: Exathlon_1_5_1000000_86
+2026-03-04 10:08:30,946 - INFO - AUROC: 0.5001
+2026-03-04 10:08:30,946 - INFO - Best Threshold: 0.006362
+2026-03-04 10:08:30,946 - INFO - Best TPR: 0.4453
+2026-03-04 10:08:30,946 - INFO - Best FPR: 0.0456
+2026-03-04 10:08:31,008 - INFO - 
+Processing: Exathlon_2_1_100000_60
+2026-03-04 20:43:55,960 - INFO - AUROC: 0.9599
+2026-03-04 20:43:55,961 - INFO - Best Threshold: 0.005787
+2026-03-04 20:43:55,961 - INFO - Best TPR: 0.9660
+2026-03-04 20:43:55,961 - INFO - Best FPR: 0.0692
+2026-03-04 20:43:56,034 - INFO - 
+Processing: Exathlon_2_2_200000_69
+2026-03-04 20:49:44,248 - INFO - AUROC: 0.7879
+2026-03-04 20:49:44,248 - INFO - Best Threshold: 0.000000
+2026-03-04 20:49:44,248 - INFO - Best TPR: 0.7503
+2026-03-04 20:49:44,248 - INFO - Best FPR: 0.0244
+2026-03-04 20:49:44,311 - INFO - 
+Processing: Exathlon_2_5_1000000_87

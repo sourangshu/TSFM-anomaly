@@ -1,0 +1,49 @@
+=== Raw data ===
+Train shape: (2050, 22)
+Test shape : (8200, 22)
+Columns (train): 22
+Total features before preprocessing: 20
+Columns fully NaN (will be dropped): 2
+Dropped columns:
+  - 4_jvm_pools_PS-Eden-Space_used_value
+  - 4_jvm_pools_PS-Old-Gen_committed_value
+
+=== After preprocessing (TRAIN) ===
+X_train shape: (2050, 18)
+y_train shape: (2050,)
+Anomaly ratio (train): 0.0
+Total features before preprocessing: 20
+Columns fully NaN (will be dropped): 0
+
+=== After preprocessing (TEST) ===
+X_test shape: (8200, 18)
+y_test shape: (8200,)
+Anomaly ratio (test): 0.6376829268292683
+
+ Preprocessing pipeline verified for ONE time series.
+Downloaded.
+ TimeFM model loaded and compiled.
+
+Computing anomaly scores using TimeFM...
+
+Running TimeFM on 18 features...
+  Feature 1/18
+  Feature 2/18
+  Feature 3/18
+  Feature 4/18
+  Feature 5/18
+  Feature 6/18
+  Feature 7/18
+  Feature 8/18
+  Feature 9/18
+  Feature 10/18
+  Feature 11/18
+  Feature 12/18
+  Feature 13/18
+  Feature 14/18
+  Feature 15/18
+  Feature 16/18
+  Feature 17/18
+  Feature 18/18
+
+ TimeFM AUROC: 0.7621
