@@ -49,7 +49,7 @@ def parse_args():
         "--score_method",
         type=str,
         default="interval",
-        choices=["mse", "interval", "normalized_deviation"],
+        choices=["mse", "interval", "normalized_deviation", "smape"],
         help=(
             "Anomaly scoring method per feature:\n"
             "  mse                 – squared error vs median (original)\n"
@@ -201,6 +201,15 @@ def compute_feature_score(y_actual, group_df, method="mse"):
 
     if method == "mse":
         return (y_actual - y_median) ** 2
+    elif method == "smape":
+        y_pred = group_df["0.5"].values  # median prediction
+
+        eps = 1e-8
+        numerator   = np.abs(y_actual - y_pred)
+        denominator = np.abs(y_actual) + np.abs(y_pred) + eps
+
+         
+        return 2*(numerator / denominator)
 
     elif method == "interval":
         upper_violation = np.maximum(0.0, y_actual - y_upper)
