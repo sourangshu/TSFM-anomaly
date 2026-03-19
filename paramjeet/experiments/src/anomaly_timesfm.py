@@ -15,7 +15,7 @@ def compute_timesfm_anomaly_scores(
     horizon,
     top_k=3,
     return_viz=False,
-    viz_subsample=1  # Har nth window store karo (memory bachane ke liye)
+    viz_subsample=1  
 ):
     """
     Compute anomaly scores using TimeFM for multiple aggregation methods:
