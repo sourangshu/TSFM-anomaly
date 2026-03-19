@@ -1,5 +1,4 @@
 """
-Improved TimeFM anomaly detection with multiple aggregation methods.
 Location: /home/paramjeet/times-fm/src/anomaly_timesfm.py
 """
 
@@ -39,7 +38,7 @@ def compute_timesfm_anomaly_scores(
     T_test, n_features = X_test.shape
     T_train, _ = X_train.shape
 
-    print(f"\n📊 TimeFM Anomaly Detection:")
+    print(f"\n TimeFM Anomaly Detection:")
     print(f"   Features: {n_features}")
     print(f"   Context: {context_len}, Horizon: {horizon}")
     print(f"   Top-K: {top_k}")
