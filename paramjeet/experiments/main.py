@@ -1,198 +1,153 @@
 import os
+import glob
 import time
-import pandas as pd
 import numpy as np
+import pandas as pd
 import torch
 import timesfm
-import sys
-import matplotlib.pyplot as plt
-import logging
-from sklearn.metrics import roc_curve, roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.preprocessing import MinMaxScaler
 
-# --------------------------------------------------
-# Add src path
-# --------------------------------------------------
-sys.path.append("/home/paramjeet/times-fm/src")
+# ==== CONFIG ====
+DATA_PATH = "/home/paramjeet/times-fm/datasets/Exathlon/*test.csv"
 
-from preprocess import fit_preprocessor, transform_preprocessor
-from anomaly_timesfm import compute_timesfm_anomaly_scores
+RUN_SINGLE = True
+SINGLE_FILE = "Exathlon_10_2_1000000_67_test.csv"
 
-# --------------------------------------------------
-# Config
-# --------------------------------------------------
-DATA_DIR = "/home/paramjeet/times-fm/datasets/Exathlon"
-OUTPUT_DIR = "/home/paramjeet/times-fm/experiments/logs_cntxt32_hr1"
+WINDOW = 100
+SPLIT_RATIO = 0.2
+CONTEXT_LEN = 512
+BATCH_SIZE = 128
+TOP_K = 3
 
-# --------------------------------------------------
-# Setup Logging
-# --------------------------------------------------
-log_file = os.path.join(OUTPUT_DIR, "run.log")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler()  # logger.infos to terminal also
-    ]
-)
-
-logger = logging.getLogger()
-
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-CONTEXT_LEN = 32
-HORIZON_LEN = 10
-
-# --------------------------------------------------
-# Load TimeFM model 
-# --------------------------------------------------
-logger.info("Loading TimeFM model...")
-
-torch.set_float32_matmul_precision("high")
-
+# ==== MODEL ====
 model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
     "google/timesfm-2.5-200m-pytorch"
 )
+model.compile(timesfm.ForecastConfig(
+    max_context=CONTEXT_LEN,
+    max_horizon=WINDOW
+))
 
-model.compile(
-    forecast_config=timesfm.ForecastConfig(
-        max_context=CONTEXT_LEN,
-        max_horizon=HORIZON_LEN,
-        normalize_inputs=True,
-        use_continuous_quantile_head=True,
-        force_flip_invariance=True,
-        infer_is_positive=True,
-        fix_quantile_crossing=True,
-    )
-)
+# ==== PREP ====
+def prepare_df(df):
+    df = df.copy()
+    df["timestamp"] = pd.date_range(start="2000-01-01", periods=len(df), freq="1s")
+    return df
 
-logger.info("Model ready.\n")
+def split_data(df):
+    split = int(len(df) * SPLIT_RATIO)
+    return df.iloc[:split].reset_index(drop=True), df.iloc[split:].reset_index(drop=True)
 
-# --------------------------------------------------
-# Get file list
-# --------------------------------------------------
-train_files = sorted([f for f in os.listdir(DATA_DIR) if "_train.csv" in f])
+# ==== FAST PREDICTION ====
+def predict_all_features(df_train, df_test, features):
+    n_features = len(features)
+    all_preds = []
 
-logger.info("Number of time series:%s", len(train_files))
+    num_windows = len(df_test) // WINDOW
+    remainder = len(df_test) % WINDOW
 
-results = []
-all_aurocs = []
+    for i in range(num_windows):
+        start = i * WINDOW
 
-start_all = time.time()
+        if i == 0:
+            train_window = df_train[features].values
+        else:
+            past_test = df_test[features].iloc[:start].values
+            train_window = np.vstack([df_train[features].values, past_test])
 
-# --------------------------------------------------
-# Loop over each time series
-# --------------------------------------------------
-for train_file in train_files:
+        contexts = []
+        for f in range(n_features):
+            context = train_window[-CONTEXT_LEN:, f]
+            contexts.append(context.astype(np.float32))
 
-    ts_name = train_file.replace("_train.csv", "")
-    test_file = train_file.replace("_train.csv", "_test.csv")
+        preds_batch = []
+        with torch.no_grad():
+            for j in range(0, len(contexts), BATCH_SIZE):
+                batch = contexts[j:j+BATCH_SIZE]
+                forecast, _ = model.forecast(horizon=WINDOW, inputs=batch)
+                preds_batch.append(np.array(forecast))
 
-    logger.info(f"\nProcessing: {ts_name}")
+        preds_batch = np.concatenate(preds_batch, axis=0)
+        preds_batch = preds_batch.reshape(n_features, WINDOW).T
+        all_preds.append(preds_batch)
 
-    train_df = pd.read_csv(os.path.join(DATA_DIR, train_file))
-    test_df  = pd.read_csv(os.path.join(DATA_DIR, test_file))
+    # remainder
+    if remainder > 0:
+        start = num_windows * WINDOW
+        past_test = df_test[features].iloc[:start].values
+        train_window = np.vstack([df_train[features].values, past_test])
 
-    # ---------------- Preprocess ----------------
-    imputer, scaler, X_train, y_train = fit_preprocessor(train_df)
-    X_test, y_test = transform_preprocessor(test_df, imputer, scaler)
+        contexts = []
+        for f in range(n_features):
+            context = train_window[-CONTEXT_LEN:, f]
+            contexts.append(context.astype(np.float32))
 
-    # ---------------- Compute anomaly scores ----------------
-    anomaly_scores, _ = compute_timesfm_anomaly_scores(
-        model=model,
-        X_train=X_train,
-        X_test=X_test,
-        y_test=y_test,
-        context_len=CONTEXT_LEN,
-        horizon=HORIZON_LEN
-    )
+        with torch.no_grad():
+            forecast, _ = model.forecast(horizon=remainder, inputs=contexts)
 
-    # Remove initial context region
-    y_valid = y_test[CONTEXT_LEN:]
-    scores_valid = anomaly_scores[CONTEXT_LEN:]
+        preds = np.array(forecast).reshape(n_features, remainder).T
+        all_preds.append(preds)
 
-    # ---------------- ROC ----------------
-    fpr, tpr, thresholds = roc_curve(y_valid, scores_valid)
-    auroc = roc_auc_score(y_valid, scores_valid)
+    return np.vstack(all_preds)
 
-    # ---------------- Best threshold (Youden’s J) ----------------
-    j_scores = tpr - fpr
-    best_idx = np.argmax(j_scores)
+# ==== FILE LIST ====
+if RUN_SINGLE:
+    base = DATA_PATH.replace("*test.csv", "")
+    files = [os.path.join(base, SINGLE_FILE)]
+else:
+    files = glob.glob(DATA_PATH)
 
-    best_threshold = thresholds[best_idx]
-    best_tpr = tpr[best_idx]
-    best_fpr = fpr[best_idx]
+# ==== TIMER START ====
+total_start = time.time()
 
-    logger.info(f"AUROC: {auroc:.4f}")
-    logger.info(f"Best Threshold: {best_threshold:.6f}")
-    logger.info(f"Best TPR: {best_tpr:.4f}")
-    logger.info(f"Best FPR: {best_fpr:.4f}")
+# ==== MAIN ====
+for f in files:
+    file_start = time.time()
 
-    # ---------------- Save ROC curve ----------------
-    roc_df = pd.DataFrame({
-        "FPR": fpr,
-        "TPR": tpr,
-        "Threshold": thresholds
-    })
+    print(f"\nProcessing: {os.path.basename(f)}")
 
-    roc_df.to_csv(
-        os.path.join(OUTPUT_DIR, f"{ts_name}_roc_curve.csv"),
-        index=False
-    )
+    df = pd.read_csv(f)
+    df = prepare_df(df)
 
-    # ---------------- Plot ROC ----------------
-    plt.figure()
-    plt.plot(fpr, tpr)
-    plt.plot([0, 1], [0, 1], linestyle="--")
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title(f"ROC Curve - {ts_name} (AUROC={auroc:.4f})")
+    features = [c for c in df.columns if c not in ["timestamp", "is_anomaly"]]
 
-    plt.savefig(os.path.join(OUTPUT_DIR, f"{ts_name}_roc.png"))
-    plt.close()
+    df_train, df_test = split_data(df)
 
-    # ---------------- Store results ----------------
-    results.append([
-        ts_name,
-        auroc,
-        best_threshold,
-        best_tpr,
-        best_fpr
-    ])
+    # ==== PREDICTION ====
+    pred_values = predict_all_features(df_train, df_test, features)
 
-    all_aurocs.append(auroc)
+    # ==== ERRORS ====
+    mae = np.abs(pred_values - df_test[features].values)
+    mse = (pred_values - df_test[features].values) ** 2
 
-# --------------------------------------------------
-# Save Summary
-# --------------------------------------------------
-summary_df = pd.DataFrame(
-    results,
-    columns=[
-        "time_series",
-        "AUROC",
-        "Best_Threshold",
-        "Best_TPR",
-        "Best_FPR"
-    ]
-)
+    # ==== SCALE ====
+    scaler = MinMaxScaler()
+    mse_scaled = scaler.fit_transform(mse)
+    mae_scaled = scaler.fit_transform(mae)
 
-summary_path = os.path.join(OUTPUT_DIR, "auroc_summary.csv")
-summary_df.to_csv(summary_path, index=False)
+    # ==== AGGREGATIONS ====
+    scores_dict = {
+        "mean": np.mean(mse_scaled, axis=1),
+        "max": np.max(mse_scaled, axis=1),
+        "l2": np.sqrt((mse_scaled ** 2).sum(axis=1)),
+        "topk": np.mean(np.sort(mse_scaled, axis=1)[:, -TOP_K:], axis=1),
+        "mae": np.mean(mae_scaled, axis=1),
+    }
 
-# ---------------- Mean AUROC ----------------
-mean_auroc = np.mean(all_aurocs)
+    y = df_test["is_anomaly"].values
 
-logger.info("\n====================================")
-logger.info("MEAN AUROC: %.4f", mean_auroc)
-logger.info("====================================")
+    print("---- Metrics ----")
+    for name, scores in scores_dict.items():
+        if len(np.unique(y)) > 1:
+            auroc = roc_auc_score(y, scores)
+            auprc = average_precision_score(y, scores)
+            print(f"{name:5} | AUROC: {auroc:.4f} | AUPRC: {auprc:.4f}")
 
-logger.info("Total time: %.2f sec", time.time() - start_all)
+    # ==== TIME ====
+    file_time = time.time() - file_start
+    print(f"Time for file: {file_time:.2f} sec")
 
-
-# Save mean AUROC separately
-with open(os.path.join(OUTPUT_DIR, "mean_auroc.txt"), "w") as f:
-    f.write(f"Mean AUROC: {mean_auroc:.6f}\n")
-
-logger.info("Total time: %.2f sec", time.time() - start_all)
+# ==== TOTAL TIME ====
+total_time = time.time() - total_start
+print(f"\nTotal Execution Time: {total_time:.2f} sec ({total_time/60:.2f} min)")
