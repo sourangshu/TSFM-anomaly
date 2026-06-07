@@ -2,19 +2,21 @@
 Single-stage anomaly-aware fine-tuning for Chronos-2.
 
 Uses a SINGLE combined dataset (normal + anomaly future pairs mixed together).
-The loss is conditioned on the future type of each sample within the batch:
+The loss is a margin (hinge) objective conditioned on the future type of each sample:
 
-    future_type == 0  (normal)  →  loss is MINIMISED  (gradient descent)
-    future_type == 1  (anomaly) →  loss is MAXIMISED  (gradient ascent)
+    L_total = L_good + lambda * max(0, tau - L_bad)
 
-Effective batch loss:
-    L = (1/B) * [ Σ_{normal} loss_i  -  Σ_{anomaly} clamp(loss_i, max=ceiling) ]
+    future_type == 0  (normal)  →  L_good : minimise (predict normal well)
+    future_type == 1  (anomaly) →  L_bad  : push UP toward margin tau, then stop
+
+The hinge self-saturates: once L_bad >= tau it adds no gradient, so training can't
+diverge (this replaces the old clamp+negate gradient-ascent ceiling).
 
 At inference: high prediction error ⟹ high anomaly score.
 
 Usage:
     python finetune_anomaly_simple.py
-    python finetune_anomaly_simple.py --finetune_mode lora --lora_r 16
+    python finetune_anomaly_simple.py --margin_tau 12 --margin_lambda 1.0
     python finetune_anomaly_simple.py --finetune_mode full --lr 1e-6
 """
 
@@ -62,7 +64,13 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
 
     def __init__(self, inputs, *args, **kwargs):
         future_types = [int(d.get("future_type", 0)) for d in inputs]
-        cleaned = [{k: v for k, v in d.items() if k != "future_type"} for d in inputs]
+        # Strip BOTH our extra keys before the parent's validation: `future_type`
+        # (the window-level label) and `future_labels` (the per-timestep array the
+        # labeled data prep emits, already collapsed into future_type upstream).
+        cleaned = [
+            {k: v for k, v in d.items() if k not in ("future_type", "future_labels")}
+            for d in inputs
+        ]
         super().__init__(cleaned, *args, **kwargs)
         # Parent filters series shorter than min_past + prediction_length. Our fixed
         # 832-step targets are never filtered, so prepared inputs align 1:1 with
@@ -92,21 +100,40 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
 
 class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
     """
-    Single-stage trainer that conditions the loss sign on future_type per sample.
+    Single-stage trainer using a margin (hinge) objective on future_type per sample.
 
-    For each batch:
-      - normal-future samples  (future_type==0): contribute +loss  (minimise)
-      - anomaly-future samples (future_type==1): contribute -clamp(loss, ceiling)
-                                                              (maximise, bounded)
+        L_total = L_good + lambda * max(0, tau - L_bad)
 
-    The two sub-batches are forwarded separately so their losses are independent.
-    Final loss is the weighted mean (weighted by sub-batch size) so the gradient
-    magnitude is comparable regardless of the normal/anomaly ratio in the batch.
+      - L_good : mean loss on normal-future samples  (future_type==0) -> minimised
+      - L_bad  : mean loss on anomaly-future samples (future_type==1) -> pushed UP,
+                 but only until it reaches the margin `tau`. Once L_bad >= tau the
+                 hinge is 0 and stops contributing gradient (self-saturating, so no
+                 divergence — this replaces the old loss_ceiling clamp+negate hack).
+
+    The two sub-batches are forwarded separately so L_good and L_bad are independent.
+
+    Parameters
+    ----------
+    margin_tau : float
+        The margin the anomaly loss is pushed toward. Must sit ABOVE the normal-point
+        loss to do anything. The Chronos-2 loss sums pinball loss over 9 quantiles, so
+        even well-predicted normal points score ~3-4 on the normalized scale — set tau
+        to ~2-4x that (e.g. 10-15), NOT 2.
+    margin_lambda : float
+        Weight on the anomaly (bad) term. 1.0 is a sensible default.
     """
 
-    def __init__(self, *args, loss_ceiling: float | None = 15.0, **kwargs):
+    def __init__(
+        self,
+        *args,
+        margin_tau: float = 12.0,
+        margin_lambda: float = 1.0,
+        loss_ceiling: float | None = None,  # accepted for back-compat; unused by hinge
+        **kwargs,
+    ):
         super().__init__(*args, loss_ceiling=loss_ceiling, **kwargs)
-        self.loss_ceiling = loss_ceiling
+        self.margin_tau = margin_tau
+        self.margin_lambda = margin_lambda
         # Running (sample-weighted) sums of the RAW per-future-type losses, so we can
         # log normal_loss / anomaly_loss separately. Train and eval are kept apart.
         self._acc = {
@@ -123,40 +150,47 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
         }
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        future_type = inputs.pop("future_type")          # (B,) — not passed to model
+        # print(f'inputs context shape is {inputs["context"].shape}')
+        # print(f'inputs future_target shape is {inputs["future_target"].shape}')
+        # print(f'inputs future_type shape is {inputs["future_type"].shape}')
+        future_type = inputs.pop("future_type")   # (B,) — not passed to model
         normal_mask  = future_type == 0
         anomaly_mask = future_type == 1
+        # print(f"Normal mask shape: {normal_mask.shape}, Anomaly mask shape: {anomaly_mask.shape}")
         n_normal  = normal_mask.sum().item()
         n_anomaly = anomaly_mask.sum().item()
-        n_total   = future_type.shape[0]
-
-        total_loss = torch.zeros(1, device=future_type.device, requires_grad=True)
+        # print(f"Batch: {n_normal} normal, {n_anomaly} anomaly")
+       
         outputs = None
         acc = self._acc["train" if model.training else "eval"]
 
-        # ── Normal sub-batch: minimise loss ──────────────────────────────────
+        # ── Normal sub-batch → L_good (minimise) ─────────────────────────────
+        L_good = torch.zeros((), device=future_type.device)
         if n_normal > 0:
             normal_out = model(**self._select(inputs, normal_mask))
-            weight = n_normal / n_total
-            total_loss = total_loss + weight * normal_out.loss
+            L_good = normal_out.loss
             outputs = normal_out
-            acc["n_sum"] += normal_out.loss.detach().item() * n_normal
+            acc["n_sum"] += L_good.detach().item() * n_normal
             acc["n_cnt"] += n_normal
 
-        # ── Anomaly sub-batch: maximise loss (gradient ascent) ────────────────
+        # ── Anomaly sub-batch → L_bad (push UP toward the margin tau) ─────────
+        L_bad = None
         if n_anomaly > 0:
-            anom_out  = model(**self._select(inputs, anomaly_mask))
-            anom_loss = anom_out.loss
-            # Log the RAW (unclamped, un-negated) prediction error on anomaly futures
-            # so the curve shows the model's true error — which we want to go UP.
-            acc["a_sum"] += anom_loss.detach().item() * n_anomaly
+            anom_out = model(**self._select(inputs, anomaly_mask))
+            L_bad = anom_out.loss
+            # Log the RAW prediction error on anomaly futures — we want this to go UP.
+            acc["a_sum"] += L_bad.detach().item() * n_anomaly
             acc["a_cnt"] += n_anomaly
-            if self.loss_ceiling is not None:
-                anom_loss = torch.clamp(anom_loss, max=self.loss_ceiling)
-            weight = n_anomaly / n_total
-            total_loss = total_loss - weight * anom_loss
             if outputs is None:
                 outputs = anom_out
+
+        # ── Combine: L_total = L_good + lambda * max(0, tau - L_bad) ──────────
+        # The hinge is active only while L_bad < tau; once the anomaly loss clears
+        # the margin it contributes no gradient, so training cannot diverge.
+        total_loss = L_good
+        if L_bad is not None:
+            hinge = torch.clamp(self.margin_tau - L_bad, min=0.0)
+            total_loss = total_loss + self.margin_lambda * hinge
 
         return (total_loss, outputs) if return_outputs else total_loss
 
@@ -199,14 +233,17 @@ def parse_args():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
     # Data
-    p.add_argument("--data_dir", default="./prepared_data_simple",
-                   help="Output dir from inst_data_prepare_simple.py "
+    p.add_argument("--data_dir", default="./prepared_data_labeled",
+                   help="Output dir from inst_data_prepare_labeled.py "
                         "(must contain train_model_inputs.pkl / val_model_inputs.pkl)")
+    p.add_argument("--anomaly_threshold", type=int, default=10,
+                   help="A future window is labeled anomalous (future_type=1) iff it "
+                        "contains at least this many anomalous timesteps; else normal.")
     p.add_argument("--no_validation", action="store_true")
 
     # Fine-tuning mode
     p.add_argument("--finetune_mode", default="lora", choices=["full", "lora"])
-    p.add_argument("--lora_r",        type=int,   default=16)
+    p.add_argument("--lora_r",        type=int,   default=32)
     p.add_argument("--lora_alpha",    type=int,   default=16)
     p.add_argument("--lora_dropout",  type=float, default=0.0)
 
@@ -229,10 +266,12 @@ def parse_args():
     p.add_argument("--lr_scheduler_type", default="cosine",
                    choices=["linear", "cosine", "cosine_with_restarts", "constant"])
 
-    # Loss ceiling for anomaly gradient ascent
-    p.add_argument("--loss_ceiling", type=float, default=15.0,
-                   help="Cap anomaly loss before negating. Prevents divergence. "
-                        "Set 0 to disable.")
+    # Margin (hinge) loss: L_good + lambda * max(0, tau - L_bad)
+    p.add_argument("--margin_tau", type=float, default=12.0,
+                   help="Margin the anomaly loss is pushed toward. Must sit ABOVE the "
+                        "normal-point loss (~3-4 here) to matter — use ~10-15, NOT 2.")
+    p.add_argument("--margin_lambda", type=float, default=1.0,
+                   help="Weight on the anomaly (bad) term. Default 1.0.")
 
     # Output
     p.add_argument("--output_dir", default="./chronos2-single-stage")
@@ -248,13 +287,36 @@ def load_data(path: str, label: str) -> list[dict]:
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"{label} data not found at {path}. "
-            "Run inst_data_prepare_simple.py first."
+            "Run inst_data_prepare_labeled.py first."
         )
     logger.info(f"Loading {label} from {path}")
     with open(path, "rb") as f:
         data = pickle.load(f)
-    n_anom = sum(d.get("future_type", 0) for d in data)
-    logger.info(f"  {len(data)} samples — normal={len(data)-n_anom}, anomaly={n_anom}")
+    logger.info(f"  {len(data)} samples loaded")
+    return data
+
+
+def derive_future_type(data: list[dict], threshold: int, label: str) -> list[dict]:
+    """
+    Collapse the per-timestep `future_labels` array (length = prediction_length) into a
+    single window-level `future_type` via a count threshold:
+
+        future_type = 1 (anomaly)  if  (#anomalous steps in the window) >= threshold
+        future_type = 0 (normal)   otherwise
+
+    Mutates each dict in place, adding `future_type`. Samples that already carry a
+    `future_type` and have no `future_labels` (e.g. old-format data) are left as-is.
+    """
+    n_anom = 0
+    for d in data:
+        labels = d.get("future_labels")
+        if labels is not None:
+            d["future_type"] = int(int(np.sum(labels)) >= threshold)
+        n_anom += int(d.get("future_type", 0))
+    logger.info(
+        f"  {label}: threshold={threshold} ones/window -> "
+        f"anomaly={n_anom}, normal={len(data) - n_anom}"
+    )
     return data
 
 
@@ -285,16 +347,28 @@ def main():
     args = parse_args()
 
     if args.lr is None:
-        args.lr = 1e-5 if args.finetune_mode == "lora" else 1e-6
+        args.lr = 5e-6 if args.finetune_mode == "lora" else 1e-6
     use_fp16 = args.fp16 and args.device != "cpu" and torch.cuda.is_available()
-    loss_ceiling = args.loss_ceiling if args.loss_ceiling > 0 else None
 
     # ── Load data ─────────────────────────────────────────────────────────────
     train_path = os.path.join(args.data_dir, "train_model_inputs.pkl")
     val_path   = os.path.join(args.data_dir, "val_model_inputs.pkl")
 
     train_data = load_data(train_path, "train")
+    # print(train_data[0]['target'].shape)
+    # print(train_data[0]['future_labels'].shape)
+    
+    debug = True
     val_data   = load_data(val_path, "val") if not args.no_validation else None
+    if debug == True:
+        train_data = train_data[:50]
+        if val_data is not None:
+            val_data = val_data[:50]
+
+    # Collapse per-timestep future_labels -> window-level future_type via the threshold.
+    derive_future_type(train_data, args.anomaly_threshold, "train")
+    if val_data is not None:
+        derive_future_type(val_data, args.anomaly_threshold, "val")
 
     # ── Load model ────────────────────────────────────────────────────────────
     logger.info(f"Loading {args.model_id} on {args.device}")
@@ -325,7 +399,9 @@ def main():
         warmup_ratio=args.warmup_ratio,
         lr_scheduler_type=args.lr_scheduler_type,
         trainer_cls=functools.partial(
-            Chronos2SingleStageTrainer, loss_ceiling=loss_ceiling
+            Chronos2SingleStageTrainer,
+            margin_tau=args.margin_tau,
+            margin_lambda=args.margin_lambda,
         ),
     )
     if val_data is not None:
@@ -346,7 +422,8 @@ def main():
 
     logger.info(
         f"Single-stage training: lr={args.lr}, steps={args.num_steps}, "
-        f"batch={args.batch_size}, loss_ceiling={loss_ceiling}, fp16={use_fp16}"
+        f"batch={args.batch_size}, margin_tau={args.margin_tau}, "
+        f"margin_lambda={args.margin_lambda}, fp16={use_fp16}"
     )
     pipeline.fit(**fit_kwargs)
 
