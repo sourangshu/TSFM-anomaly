@@ -239,6 +239,8 @@ class Chronos2Model(PreTrainedModel):
             dropout_p=config.dropout_rate,
         )
 
+        # print(f"------------------ Input_patch_Embedding: {self.input_patch_embedding}")
+
         # patching layer
         self.patch = Patch(
             patch_size=self.chronos_config.input_patch_size, patch_stride=self.chronos_config.input_patch_stride
@@ -263,6 +265,8 @@ class Chronos2Model(PreTrainedModel):
             act_fn_name=config.dense_act_fn,
             dropout_p=config.dropout_rate,
         )
+
+        # print(f"------------------ Output_patch_Embedding: {self.output_patch_embedding}")
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -429,7 +433,8 @@ class Chronos2Model(PreTrainedModel):
             .div(cast(int, self.chronos_config.time_encoding_scale))
             .to(self.dtype)
         )
-
+        # print(f"------------------TIME ENC SCALE: {self.chronos_config.time_encoding_scale}")
+        # print(f"--------------------context_time_enc: {context_time_enc.shape}")
         # concat time encoding, context and mask along the last (feature) dim
         patched_context = torch.cat([context_time_enc, patched_context, patched_mask], dim=-1)
 
@@ -556,6 +561,10 @@ class Chronos2Model(PreTrainedModel):
         loss_mask = future_target_mask.float() * inv_future_covariate_mask
         loss = quantile_loss * loss_mask
         # mean over prediction horizon, sum over quantile levels and mean over batch
+        
+        print(f">>>>>>>>>>>>>>>Original: LOSS: {loss.shape}")
+        # temp = loss.mean(dim=-1).detach()
+        # print(f"<>>>>>>>>>>>>>loss.mean() {temp.shape}")
         loss = loss.mean(dim=-1).sum(dim=-1).mean()
 
         return loss
@@ -588,6 +597,7 @@ class Chronos2Model(PreTrainedModel):
             context=context, context_mask=context_mask
         )
         num_context_patches = attention_mask.shape[-1]
+        # print(f">>>>>>>>>>>>>>>>>/////patched_context: {patched_context.shape} ")
 
         # get input embeddings of shape (batch, num_context_patches, d_model)
         input_embeds: torch.Tensor = self.input_patch_embedding(patched_context)
@@ -595,6 +605,7 @@ class Chronos2Model(PreTrainedModel):
         # insert [SEP] special token between normal patches and context patches, if needed
         if self.chronos_config.use_sep_token:
             sep_idx = self.chronos_config.sep_patch_index
+            # print(f"888888888888888888>>>>>>>>> sep-idx: {sep_idx}")
             sep_input_ids = torch.full((batch_size, 1), self.config.sep_token_id, device=input_embeds.device)
             sep_embeds = self.shared(sep_input_ids)
             sep_mask = torch.ones(batch_size, 1, device=self.device)
@@ -606,6 +617,7 @@ class Chronos2Model(PreTrainedModel):
                 dim=1,
             )
 
+        print(f">>>>>>>>>>>>>>>>>>>>.. After [SEP]: {input_embeds.shape}")
         # append [REG] special token embedding, if needed
         if self.chronos_config.use_reg_token:
             reg_input_ids = torch.full((batch_size, 1), self.config.reg_token_id, device=input_embeds.device)
@@ -614,6 +626,9 @@ class Chronos2Model(PreTrainedModel):
             attention_mask = torch.cat(
                 [attention_mask.to(self.dtype), torch.ones_like(reg_input_ids).to(self.dtype)], dim=-1
             )
+
+        print(f">>>>>>>>>>>>>>>>>>>>.. After [REG]: {input_embeds.shape}")
+
 
         patched_future, patched_future_covariates_mask = self._prepare_patched_future(
             future_covariates=future_covariates,
@@ -641,6 +656,9 @@ class Chronos2Model(PreTrainedModel):
             group_ids=group_ids,
             output_attentions=output_attentions,
         )
+
+        print(f">>>>>>>>>>>>>>>>>>>>.. Finally after Horizon (48 + 1 + 1 + 4): {input_embeds.shape}")
+
         return encoder_outputs, loc_scale, patched_future_covariates_mask, num_context_patches
 
     def forward(
@@ -722,6 +740,17 @@ class Chronos2Model(PreTrainedModel):
         - enc_group_self_attn_weights: Group self attention weights, if output_attentions=True
         """
         batch_size = context.shape[0]
+
+        # print("==========Inside Chronos2Model forward() -------------")
+        # print(f"context: {context[0].shape}")
+        # print(len(context))
+        # print(f"BatchSize: {batch_size}")
+        # print(f"future_covariates: {future_covariates.shape}")
+        # print(f"future_target: {future_target.shape}")
+
+
+
+        
         encoder_outputs, loc_scale, patched_future_covariates_mask, num_context_patches = self.encode(
             context=context,
             context_mask=context_mask,

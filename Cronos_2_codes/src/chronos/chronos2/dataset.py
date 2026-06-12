@@ -542,6 +542,8 @@ class Chronos2Dataset(IterableDataset):
         self.min_past = min_past
         self.mode = mode
 
+        # print("Original Chronos2Dataset init's super() _------------------")
+
     def _construct_slice(self, input_idx: int) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, int]:
         prepared = self.inputs[input_idx]
         past_tensor = prepared["context"].clone()  # shape: (n_targets + n_covariates, history_length)
@@ -643,11 +645,16 @@ class Chronos2Dataset(IterableDataset):
             current_batch_size = 0
             input_indices = []
 
+            # count_window = 0
             while current_batch_size < self.batch_size:
                 input_idx = np.random.randint(len(self.inputs))
                 input_indices.append(input_idx)
                 current_batch_size += self.inputs[input_idx]["context"].shape[0]
+                # print(f"-==========_GEn: {self.inputs[input_idx]["context"].shape[0]}---------------")
+                # print(f"*******************current_batch_size: {current_batch_size}")
+                # count_window += 1
 
+            # print(f"------------88***count_window:: {count_window}")
             yield self._build_batch(input_indices)
 
     def _generate_sequential_batches(self):

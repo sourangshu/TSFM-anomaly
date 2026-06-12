@@ -43,6 +43,19 @@ class Chronos2Trainer(Trainer):
     batching ourselves in a custom dataset which directly returns batches instead of individual elements.
     """
 
+    def train(self, *args, **kwargs):
+        # OVERride
+        # print("--------------------------DEBUG: Chronos2Trainer.train() starting-----------------------", flush=True)
+        
+
+        
+        result = super().train(*args, **kwargs)
+        
+
+        
+        # print("DEBUG: Chronos2Trainer.train() finished", flush=True)
+        return result
+
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
@@ -71,6 +84,8 @@ class Chronos2Trainer(Trainer):
             "worker_init_fn": seed_worker,
             "prefetch_factor": self.args.dataloader_prefetch_factor,
         }
+        # print("----Chronos2Trainer----> get_train_dataloader() ")
+
 
         return DataLoader(train_dataset, **dataloader_params)  # type: ignore
 

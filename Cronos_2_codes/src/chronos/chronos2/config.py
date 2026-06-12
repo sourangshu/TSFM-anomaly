@@ -107,8 +107,8 @@ class Chronos2ForecastingConfig:
     input_patch_stride: int
     quantiles: List[float]
     use_reg_token: bool = False
-    use_sep_token: bool = False
-    sep_patch_index: int = 0
+    use_sep_token: bool = False # added
+    sep_patch_index: int = 0 # added
     use_arcsinh: bool = False
     max_output_patches: int = 1
     time_encoding_scale: int | None = None

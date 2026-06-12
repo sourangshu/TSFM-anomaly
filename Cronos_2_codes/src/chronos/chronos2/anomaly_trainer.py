@@ -30,10 +30,14 @@ class Chronos2AnomalyTrainer(Chronos2Trainer):
     """
 
     def __init__(self, *args, loss_ceiling=None, **kwargs):
+        # print("-------------------Chronos2AnomalyTrainer----------------------")
         super().__init__(*args, **kwargs)
         self.loss_ceiling = loss_ceiling
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+       
+
+
         loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
 
         # Clamp before negating so ascent stops once loss is "bad enough".

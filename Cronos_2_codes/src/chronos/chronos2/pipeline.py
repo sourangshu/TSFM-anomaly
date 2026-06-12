@@ -187,6 +187,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
         -------
         A new `Chronos2Pipeline` with the fine-tuned model
         """
+        # print("----------------Inside pipeline __________- ")
 
         import torch.cuda
         from transformers.trainer_callback import PrinterCallback
@@ -274,6 +275,11 @@ class Chronos2Pipeline(BaseChronosPipeline):
         if min_past is None:
             min_past = prediction_length
 
+        
+        # print(f"Debug:   Inputs: {inputs[0].keys()} ")
+        
+        # print(f"Before monkey patching-------")
+
         train_dataset = Chronos2Dataset(
             inputs=inputs,
             context_length=context_length,
@@ -284,6 +290,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             mode=DatasetMode.TRAIN,
             convert_inputs=convert_inputs,
         )
+
 
         if output_dir is None:
             output_dir = Path("chronos-2-finetuned") / time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -360,8 +367,15 @@ class Chronos2Pipeline(BaseChronosPipeline):
 
         training_kwargs.update(extra_trainer_kwargs)
 
+        # bf16 and fp16 are mutually exclusive in TrainingArguments.
+        # If both ended up True (e.g. caller passed fp16=True on an SM80+ GPU that
+        # already has bf16=True), prefer bf16 — it is strictly better on those GPUs.
+        if training_kwargs.get("bf16") and training_kwargs.get("fp16"):
+            training_kwargs["fp16"] = False
+
         # Pop trainer_cls before passing to TrainingArguments (not a valid TrainingArguments kwarg)
         trainer_cls = training_kwargs.pop("trainer_cls", Chronos2Trainer)
+        # print(f"trainer_cls: {type(trainer_cls)}")
 
         if training_kwargs["tf32"]:
             # setting tf32=True changes these global properties, we copy them here so that
