@@ -56,11 +56,11 @@ LR="${LR:-}"                                    # blank → script default (1e-5
 BATCH_SIZE="${BATCH_SIZE:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"                   # effective batch = BATCH_SIZE * GRAD_ACCUM
 LOGGING_STEPS="${LOGGING_STEPS:-2}"
-EVAL_STEPS="${EVAL_STEPS:-$LOGGING_STEPS}"      # validate + log eval_loss every N steps (must divide 100)
+EVAL_STEPS="${EVAL_STEPS:-5}"      # validate + log eval_loss every N steps (must divide 100)
 WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 FP16="${FP16:-1}"                               # 1 = fp16 mixed precision, 0 = disable
-NO_VALIDATION="${NO_VALIDATION:-1}"             # set to 1 to disable validation
+NO_VALIDATION="${NO_VALIDATION:-0}"             # set to 1 to disable validation
 DEBUG="${DEBUG:-0}"                             # set to 1 to truncate train/val to 50 samples (smoke test)
 
 # A future window is labeled anomalous (future_type=1) iff it contains at least

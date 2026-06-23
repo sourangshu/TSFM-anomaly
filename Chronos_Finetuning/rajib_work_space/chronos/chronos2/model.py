@@ -600,7 +600,8 @@ class Chronos2Model(PreTrainedModel):
         input_embeds: torch.Tensor = self.input_patch_embedding(patched_context)
         
 
-        print(f"*****************input embedding shape initially: {input_embeds.shape}*****************")
+        # print(f"*****************input embedding shape initially: {input_embeds.shape}*****************")
+
 
         # insert [SEP] special token between normal patches and context patches, if needed
         if self.chronos_config.use_sep_token:
@@ -616,7 +617,7 @@ class Chronos2Model(PreTrainedModel):
                 [attention_mask[:, :sep_idx].to(self.dtype), sep_mask.to(self.dtype), attention_mask[:, sep_idx:].to(self.dtype)],
                 dim=1,
             )
-        print(f"*****************input embedding shape after adding SEP token (if used): {input_embeds.shape}*****************")
+        # print(f"*****************input embedding shape after adding SEP token (if used): {input_embeds.shape}*****************")
 
         # append [REG] special token embedding, if needed
         if self.chronos_config.use_reg_token:
@@ -627,7 +628,7 @@ class Chronos2Model(PreTrainedModel):
                 [attention_mask.to(self.dtype), torch.ones_like(reg_input_ids).to(self.dtype)], dim=-1
             )
 
-        print(f"*****************input embedding shape after adding REG token (if used): {input_embeds.shape}*****************")
+        # print(f"*****************input embedding shape after adding REG token (if used): {input_embeds.shape}*****************")
         # print(f"future_target: {future_target}")
         patched_future, patched_future_covariates_mask = self._prepare_patched_future(
             future_covariates=future_covariates,
@@ -655,7 +656,7 @@ class Chronos2Model(PreTrainedModel):
             group_ids=group_ids,
             output_attentions=output_attentions,
         )
-        print(f"*****************input embedding shape 48 + 1 + 1 + 4: {input_embeds.shape}*****************")
+        # print(f"*****************input embedding shape 48 + 1 + 1 + 4: {input_embeds.shape}*****************")
 
         return encoder_outputs, loc_scale, patched_future_covariates_mask, num_context_patches
 
