@@ -149,10 +149,14 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
         self.margin_tau = margin_tau
         self.margin_lambda = margin_lambda
         # Running (sample-weighted) sums of the RAW per-future-type losses, so we can
-        # log normal_loss / anomaly_loss separately. Train and eval are kept apart.
+        # log normal_loss / anomaly_loss (pinball) and mse_normal_window /
+        # mse_anomalous_window (MSE) separately. Train and eval are kept apart.
+        # *_sum  -> pinball loss, *_mse_sum -> mse, both weighted by the row count.
         self._acc = {
-            "train": {"n_sum": 0.0, "n_cnt": 0, "a_sum": 0.0, "a_cnt": 0},
-            "eval":  {"n_sum": 0.0, "n_cnt": 0, "a_sum": 0.0, "a_cnt": 0},
+            "train": {"n_sum": 0.0, "n_mse_sum": 0.0, "n_cnt": 0,
+                      "a_sum": 0.0, "a_mse_sum": 0.0, "a_cnt": 0},
+            "eval":  {"n_sum": 0.0, "n_mse_sum": 0.0, "n_cnt": 0,
+                      "a_sum": 0.0, "a_mse_sum": 0.0, "a_cnt": 0},
         }
 
 
@@ -187,6 +191,8 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
             L_good = normal_out.loss
             outputs = normal_out
             acc["n_sum"] += L_good.detach().item() * n_normal
+            if normal_out.mse is not None:
+                acc["n_mse_sum"] += normal_out.mse.detach().item() * n_normal
             acc["n_cnt"] += n_normal
 
         # ── Anomaly sub-batch → L_bad (push UP toward the margin tau) ─────────
@@ -196,6 +202,8 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
             L_bad = anom_out.loss
             # Log the RAW prediction error on anomaly futures — we want this to go UP.
             acc["a_sum"] += L_bad.detach().item() * n_anomaly
+            if anom_out.mse is not None:
+                acc["a_mse_sum"] += anom_out.mse.detach().item() * n_anomaly
             acc["a_cnt"] += n_anomaly
             if outputs is None:
                 outputs = anom_out
@@ -217,11 +225,22 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
         phase = "eval" if any(k.startswith("eval_") for k in logs) else "train"
         acc = self._acc[phase]
         prefix = "eval_" if phase == "eval" else ""
+        
         if acc["n_cnt"] > 0:
-            logs[f"{prefix}normal_loss"] = acc["n_sum"] / acc["n_cnt"]
+            logs[f"{prefix}normal_loss"] = round(acc["n_sum"] / acc["n_cnt"], 4)
+            logs[f"{prefix}mse_normal_window"] = round(acc["n_mse_sum"] / acc["n_cnt"], 4)
         if acc["a_cnt"] > 0:
-            logs[f"{prefix}anomaly_loss"] = acc["a_sum"] / acc["a_cnt"]
-        self._acc[phase] = {"n_sum": 0.0, "n_cnt": 0, "a_sum": 0.0, "a_cnt": 0}
+            logs[f"{prefix}anomaly_loss"] = round(acc["a_sum"] / acc["a_cnt"], 4)
+            logs[f"{prefix}mse_anomalous_window"] = round(acc["a_mse_sum"] / acc["a_cnt"], 4)
+
+        if phase == "eval":
+            print(f"\n======================================================")
+            print(f" [EVALUATION] Normal Loss: {logs.get('eval_normal_loss', 'N/A')} | Anomaly Loss: {logs.get('eval_anomaly_loss', 'N/A')}")
+            print(f"              MSE Normal:  {logs.get('eval_mse_normal_window', 'N/A')} | MSE Anomalous: {logs.get('eval_mse_anomalous_window', 'N/A')}")
+            print(f"======================================================\n", flush=True)
+
+        self._acc[phase] = {"n_sum": 0.0, "n_mse_sum": 0.0, "n_cnt": 0,
+                            "a_sum": 0.0, "a_mse_sum": 0.0, "a_cnt": 0}
         out = super().log(logs, *args, **kwargs)
         # Persist the loss history every logging step. Without this, runs with
         # save_strategy="no" (i.e. --no_validation) never write trainer_state.json

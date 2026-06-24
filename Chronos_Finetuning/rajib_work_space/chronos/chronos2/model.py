@@ -190,6 +190,7 @@ class Chronos2Encoder(nn.Module):
 @dataclass
 class Chronos2Output(ModelOutput):
     loss: torch.Tensor | None = None
+    mse: torch.Tensor | None = None
     quantile_preds: torch.Tensor | None = None
     enc_time_self_attn_weights: tuple[torch.Tensor, ...] | None = None
     enc_group_self_attn_weights: tuple[torch.Tensor, ...] | None = None
@@ -523,7 +524,7 @@ class Chronos2Model(PreTrainedModel):
         patched_future_covariates_mask: torch.Tensor,
         loc_scale: tuple[torch.Tensor, torch.Tensor],
         num_output_patches: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = future_target.shape[0]
         output_patch_size = self.chronos_config.output_patch_size
         assert quantile_preds.shape[0] == batch_size and quantile_preds.shape[-1] >= future_target.shape[-1]
@@ -564,8 +565,17 @@ class Chronos2Model(PreTrainedModel):
         # mean over prediction horizon, sum over quantile levels and mean over batch
         # print(f"------------------loss shape: {loss.shape}------------------")
         loss = loss.mean(dim=-1).sum(dim=-1).mean()
+        # ── MSE block ────────────────────────────────────────────────────────────
+        # point estimate: mean across quantile dimension  (b, 1, T)
+        mean_pred = quantile_preds.mean(dim=1, keepdim=True)          # (b, 1, T)
+        squared_errors = (future_target - mean_pred) ** 2             # (b, 1, T)
+        masked_sq_errors = squared_errors * loss_mask                 # zero-out masked positions
+        # mean only over *valid* (unmasked) positions to avoid bias from padding/missing values
+        num_valid = loss_mask.sum().clamp(min=1)                      # scalar, avoid /0
+        mse = masked_sq_errors.sum() / num_valid                      # scalar
+        # ─────────────────────────────────────────────────────────────────────────
 
-        return loss
+        return loss,mse
 
     def encode(
         self,
@@ -766,7 +776,7 @@ class Chronos2Model(PreTrainedModel):
             p=self.chronos_config.output_patch_size,
         )
 
-        loss = (
+        loss, mse = (
             self._compute_loss(
                 quantile_preds=quantile_preds,
                 future_target=future_target,
@@ -797,6 +807,7 @@ class Chronos2Model(PreTrainedModel):
 
         return Chronos2Output(
             loss=loss,
+            mse = mse,
             quantile_preds=quantile_preds,
             enc_time_self_attn_weights=encoder_outputs.all_time_self_attn_weights,
             enc_group_self_attn_weights=encoder_outputs.all_group_self_attn_weights,
