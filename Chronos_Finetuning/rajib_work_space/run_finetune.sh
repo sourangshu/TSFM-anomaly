@@ -35,8 +35,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Output dir from inst_data_prepare_labeled.py — must contain the combined
 # train_model_inputs.pkl / val_model_inputs.pkl at its root (each sample carrying
 # the per-timestep future_labels array).
-PREPARED_DIR="${PREPARED_DIR:-${REPO_ROOT}/rajib_work_space/prepared_data_labeled/}"
+PREPARED_DIR="${PREPARED_DIR:-${REPO_ROOT}/rajib_work_space/prepared_data_labeled/}" # train & val data
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/rajib_work_space/chronos2-single-stage_NS1000_V5}"
+
+# Optional third dataset (full path to a .pkl). When set, it is evaluated and
+# logged every eval step exactly like validation (no weight updates), as eval_test_*.
+TEST_DATA="${TEST_DATA:-${REPO_ROOT}/rajib_work_space/prepared_data_labeled/test_model_inputs.pkl}" # test data, ignored if set empty
 
 # Model
 MODEL_ID="${MODEL_ID:-amazon/chronos-2}"
@@ -56,7 +60,7 @@ LR="${LR:-}"                                    # blank → script default (1e-5
 BATCH_SIZE="${BATCH_SIZE:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"                   # effective batch = BATCH_SIZE * GRAD_ACCUM
 LOGGING_STEPS="${LOGGING_STEPS:-2}"
-EVAL_STEPS="${EVAL_STEPS:-5}"      # validate + log eval_loss every N steps (must divide 100)
+EVAL_STEPS="${EVAL_STEPS:-4}"      # validate + log eval_loss every N steps (must divide 100)
 WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 FP16="${FP16:-1}"                               # 1 = fp16 mixed precision, 0 = disable
@@ -186,6 +190,9 @@ FINETUNE_ARGS=(
 
 # Learning rate — omit entirely to use the script's built-in default
 [ -n "${LR}" ] && FINETUNE_ARGS+=(--lr "$LR")
+
+# Optional third (test) dataset — evaluated like validation, logged as eval_test_*
+[ -n "${TEST_DATA}" ] && FINETUNE_ARGS+=(--test_data "$TEST_DATA")
 
 # Flags
 [ "${NO_VALIDATION}" = "1" ] && FINETUNE_ARGS+=(--no_validation)

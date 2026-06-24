@@ -343,15 +343,29 @@ class Chronos2Pipeline(BaseChronosPipeline):
         eval_dataset = None
         callbacks = callbacks or []
         if validation_inputs is not None:
-            eval_dataset = Chronos2Dataset(
-                inputs=validation_inputs,
-                context_length=context_length,
-                prediction_length=prediction_length,
-                batch_size=batch_size,
-                output_patch_size=self.model_output_patch_size,
-                mode=DatasetMode.VALIDATION,
-                convert_inputs=convert_inputs,
-            )
+            def _build_eval_dataset(vi):
+                return Chronos2Dataset(
+                    inputs=vi,
+                    context_length=context_length,
+                    prediction_length=prediction_length,
+                    batch_size=batch_size,
+                    output_patch_size=self.model_output_patch_size,
+                    mode=DatasetMode.VALIDATION,
+                    convert_inputs=convert_inputs,
+                )
+
+            # `validation_inputs` may be a single set of inputs OR a dict
+            # {name: inputs}. In the dict case HF's Trainer evaluates each entry
+            # separately and prefixes the metrics with the dataset name, e.g.
+            # eval_val_loss / eval_test_loss. Best-model selection then references
+            # exactly one of them (the first key).
+            if isinstance(validation_inputs, dict):
+                eval_dataset = {name: _build_eval_dataset(vi) for name, vi in validation_inputs.items()}
+                primary_name = next(iter(validation_inputs))
+                metric_for_best_model = f"eval_{primary_name}_loss"
+            else:
+                eval_dataset = _build_eval_dataset(validation_inputs)
+                metric_for_best_model = "eval_loss"
 
             # set validation parameters
             training_kwargs["save_strategy"] = "steps"
@@ -359,7 +373,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             training_kwargs["eval_strategy"] = "steps"
             training_kwargs["eval_steps"] = 100
             training_kwargs["load_best_model_at_end"] = True
-            training_kwargs["metric_for_best_model"] = "eval_loss"
+            training_kwargs["metric_for_best_model"] = metric_for_best_model
             training_kwargs["label_names"] = ["future_target"]
 
             # add callback to ensure that the final model is evaluated

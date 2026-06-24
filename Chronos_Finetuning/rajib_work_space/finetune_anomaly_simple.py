@@ -219,13 +219,30 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
         return (total_loss, outputs) if return_outputs else total_loss
 
     def log(self, logs: dict, *args, **kwargs):
-        """Inject separate normal/anomaly loss means into trainer_state.json log_history."""
+        """Inject separate normal/anomaly loss means into trainer_state.json log_history.
+
+        With a dict eval_dataset, HF calls log() once per dataset, with the dataset
+        name baked into the standard loss key: "eval_loss" (single set), or
+        "eval_val_loss" / "eval_test_loss" (named sets). We mirror that prefix onto
+        our custom normal/anomaly keys so each dataset is logged independently.
+        A training log instead carries the bare "loss".
+        """
         # print("--------------------LOG function()-----------------")
-        # An eval log carries "eval_loss"; a training log carries "loss".
-        phase = "eval" if any(k.startswith("eval_") for k in logs) else "train"
+        # Find the standard eval loss key (excluding our own derived keys) to learn
+        # both the phase and the per-dataset prefix.
+        eval_loss_keys = [
+            k for k in logs
+            if k.startswith("eval") and k.endswith("loss")
+            and not (k.endswith("normal_loss") or k.endswith("anomaly_loss"))
+        ]
+        if eval_loss_keys:
+            phase = "eval"
+            prefix = eval_loss_keys[0][: -len("loss")]  # "eval_" / "eval_val_" / "eval_test_"
+        else:
+            phase = "train"
+            prefix = ""
         acc = self._acc[phase]
-        prefix = "eval_" if phase == "eval" else ""
-        
+
         if acc["n_cnt"] > 0:
             logs[f"{prefix}normal_loss"] = round(acc["n_sum"] / acc["n_cnt"], 4)
             logs[f"{prefix}mse_normal_window"] = round(acc["n_mse_sum"] / acc["n_cnt"], 4)
@@ -234,9 +251,10 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
             logs[f"{prefix}mse_anomalous_window"] = round(acc["a_mse_sum"] / acc["a_cnt"], 4)
 
         if phase == "eval":
+            tag = prefix.rstrip("_").upper()  # "EVAL" / "EVAL_VAL" / "EVAL_TEST"
             print(f"\n======================================================")
-            print(f" [EVALUATION] Normal Loss: {logs.get('eval_normal_loss', 'N/A')} | Anomaly Loss: {logs.get('eval_anomaly_loss', 'N/A')}")
-            print(f"              MSE Normal:  {logs.get('eval_mse_normal_window', 'N/A')} | MSE Anomalous: {logs.get('eval_mse_anomalous_window', 'N/A')}")
+            print(f" [{tag}] Normal Loss: {logs.get(f'{prefix}normal_loss', 'N/A')} | Anomaly Loss: {logs.get(f'{prefix}anomaly_loss', 'N/A')}")
+            print(f"              MSE Normal:  {logs.get(f'{prefix}mse_normal_window', 'N/A')} | MSE Anomalous: {logs.get(f'{prefix}mse_anomalous_window', 'N/A')}")
             print(f"======================================================\n", flush=True)
 
         self._acc[phase] = {"n_sum": 0.0, "n_mse_sum": 0.0, "n_cnt": 0,
@@ -276,6 +294,10 @@ def parse_args():
                    help="A future window is labeled anomalous (future_type=1) iff it "
                         "contains at least this many anomalous timesteps; else normal.")
     p.add_argument("--no_validation", action="store_true")
+    p.add_argument("--test_data", default=None,
+                   help="Optional path to a third dataset pkl (e.g. test_model_inputs.pkl). "
+                        "It is evaluated and logged every eval step exactly like the validation "
+                        "set (forward + loss only, NO weight updates). Logged as eval_test_*.")
     p.add_argument("--debug", action="store_true",
                    help="Truncate train/val to the first 50 samples for a quick smoke test.")
 
@@ -400,16 +422,26 @@ def main():
     # print(train_data[0]['future_labels'].shape)
     
     val_data   = load_data(val_path, "val") if not args.no_validation else None
+    # Optional third dataset, evaluated exactly like val (no weight updates).
+    test_data = (
+        load_data(args.test_data, "test")
+        if (args.test_data and not args.no_validation)
+        else None
+    )
     if args.debug:
-        logger.info("DEBUG mode: truncating train/val to the first 50 samples.")
+        logger.info("DEBUG mode: truncating train/val/test to the first 50 samples.")
         train_data = train_data[:50]
         if val_data is not None:
             val_data = val_data[:50]
+        if test_data is not None:
+            test_data = test_data[:50]
 
     # Collapse per-timestep future_labels -> window-level future_type via the threshold.
     derive_future_type(train_data, args.anomaly_threshold, "train")
     if val_data is not None:
         derive_future_type(val_data, args.anomaly_threshold, "val")
+    if test_data is not None:
+        derive_future_type(test_data, args.anomaly_threshold, "test")
 
     # ── Load model ────────────────────────────────────────────────────────────
     logger.info(f"Loading {args.model_id} on {args.device}")
@@ -446,7 +478,13 @@ def main():
         ),
     )
     if val_data is not None:
-        fit_kwargs["validation_inputs"] = val_data
+        # When a test set is supplied, hand HF a dict of eval datasets. It then
+        # evaluates each one every eval step and logs eval_val_* / eval_test_*
+        # separately. Best-model selection uses the first key ("val").
+        if test_data is not None:
+            fit_kwargs["validation_inputs"] = {"val": val_data, "test": test_data}
+        else:
+            fit_kwargs["validation_inputs"] = val_data
         # Override the eval cadence hardcoded inside pipeline.fit (default 100).
         # save_steps stays at 100; HF requires save_steps % eval_steps == 0 when
         # load_best_model_at_end=True, so keep eval_steps a divisor of 100.

@@ -90,10 +90,19 @@ class Chronos2Trainer(Trainer):
         return DataLoader(train_dataset, **dataloader_params)  # type: ignore
 
     def get_eval_dataloader(self, eval_dataset: str | Dataset | None = None) -> DataLoader:
-        if self.eval_dataset is None:
+        if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
 
-        eval_dataset = cast("Chronos2Dataset", self.eval_dataset)
+        # Resolve the dataset exactly like the stock HF Trainer so that a dict
+        # eval_dataset ({"val": ..., "test": ...}) works. HF's evaluate() recurses
+        # over the dict and calls this with the *string key*, which we look up in
+        # self.eval_dataset here. (The stock override we replaced ignored the arg.)
+        if isinstance(eval_dataset, str):
+            eval_dataset = self.eval_dataset[eval_dataset]
+        elif eval_dataset is None:
+            eval_dataset = self.eval_dataset
+
+        eval_dataset = cast("Chronos2Dataset", eval_dataset)
 
         if self.args.eval_batch_size > eval_dataset.batch_size:
             warnings.warn(
