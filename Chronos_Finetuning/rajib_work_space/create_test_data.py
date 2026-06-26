@@ -18,7 +18,7 @@ with open(TRAIN_DATA_PATH, 'rb') as file:
 print(f"Train DATA length: {len(loaded_data)}")
 
 
-TEST_FRACTION = 0.5
+TEST_FRACTION = 0.15
 TILL_IDX = int(len(loaded_data) * TEST_FRACTION)
 
 test_data = loaded_data[:TILL_IDX]

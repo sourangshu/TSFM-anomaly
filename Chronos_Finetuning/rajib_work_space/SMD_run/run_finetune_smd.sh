@@ -28,20 +28,22 @@ set -euo pipefail
 #  Configuration — edit here or export before running
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Root of the chronos-forecasting repo (parent of this script's directory)
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# This script lives in rajib_work_space/SMD_run. The training entrypoint
+# (finetune_anomaly_simple.py) and the `chronos` package live one level up, in
+# rajib_work_space. Anchor everything to absolute paths so it runs from anywhere.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../rajib_work_space/SMD_run
+WORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                  # .../rajib_work_space (code root)
 
 # Paths
-# Output dir from inst_data_prepare_labeled.py — must contain the combined
-# train_model_inputs.pkl / val_model_inputs.pkl at its root (each sample carrying
-# the per-timestep future_labels array).
-PREPARED_DIR="${PREPARED_DIR:-${REPO_ROOT}/rajib_work_space/prepared_data_labeled/}" # train & val data
-OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/rajib_work_space/chronos2-single-stage_NS1000_V5}"
+# PREPARED_DIR must contain train_model_inputs.pkl (and val_model_inputs.pkl unless
+# NO_VALIDATION=1). The SMD pkls live next to this script, in SMD_run.
+PREPARED_DIR="${PREPARED_DIR:-${SCRIPT_DIR}}"                # train (& val) data = SMD_run
+OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-single-stage_SMD}"
 
 # Optional third dataset (full path to a .pkl). When set, it is evaluated and
 # logged every eval step exactly like validation (no weight updates), as eval_test_*.
-TEST_DATA="${TEST_DATA:-${REPO_ROOT}/rajib_work_space/prepared_data_labeled/test_model_inputs.pkl}" # test data, ignored if set empty
-
+# TEST_DATA="${TEST_DATA:-${REPO_ROOT}/rajib_work_space/prepared_data_labeled/test_model_inputs.pkl}" # test data, ignored if set empty
+TEST_DATA="${TEST_DATA:-}"
 # Model
 MODEL_ID="${MODEL_ID:-amazon/chronos-2}"
 DEVICE="${DEVICE:-cuda}"
@@ -55,7 +57,7 @@ PREDICTION_LENGTH="${PREDICTION_LENGTH:-64}"
 #       It must equal data-prep NORMAL_SIGNAL_LENGTH + data-prep CONTEXT_LENGTH
 #       e.g.  CONTEXT_LENGTH (768) = NORMAL_SIGNAL_LENGTH (256) + CONTEXT_LENGTH (512)
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-768}"
-NUM_STEPS="${NUM_STEPS:-5000}"
+NUM_STEPS="${NUM_STEPS:-4000}"
 LR="${LR:-1e-5}"                                    # blank → script default (1e-5 lora / 1e-6 full)
 BATCH_SIZE="${BATCH_SIZE:-160}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"                   # effective batch = BATCH_SIZE * GRAD_ACCUM
@@ -64,7 +66,7 @@ EVAL_STEPS="${EVAL_STEPS:-100}"      # validate + log eval_loss every N steps (m
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 FP16="${FP16:-1}"                               # 1 = fp16 mixed precision, 0 = disable
-NO_VALIDATION="${NO_VALIDATION:-0}"             # set to 1 to disable validation
+NO_VALIDATION="${NO_VALIDATION:-1}"             # 1 = disable validation (SMD_run has no val pkl)
 DEBUG="${DEBUG:-0}"                             # set to 1 to truncate train/val to 50 samples (smoke test)
 
 # A future window is labeled anomalous (future_type=1) iff it contains at least
@@ -161,8 +163,7 @@ echo ""
 #  Ensure the local rajib_work_space/chronos is used, not any installed package
 # ─────────────────────────────────────────────────────────────────────────────
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${WORK_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Build argument list and run
@@ -218,9 +219,9 @@ if [ "${ENABLE_SEP_TOKEN}" = "1" ]; then
 fi
 
 # Clear stale bytecode so edits made on Windows are always picked up in WSL
-find "$REPO_ROOT/rajib_work_space/chronos" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+find "$WORK_ROOT/chronos" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
-python -u finetune_anomaly_simple.py "${FINETUNE_ARGS[@]}"
+python -u "$WORK_ROOT/finetune_anomaly_simple.py" "${FINETUNE_ARGS[@]}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Done

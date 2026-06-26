@@ -786,7 +786,7 @@ class Chronos2Model(PreTrainedModel):
                 num_output_patches=num_output_patches,
             )
             if future_target is not None
-            else None
+            else (None, None)
         )
 
         # Unscale predictions
