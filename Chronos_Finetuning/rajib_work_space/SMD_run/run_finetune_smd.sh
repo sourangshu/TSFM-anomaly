@@ -37,12 +37,13 @@ WORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                  # .../rajib_work_sp
 # Paths
 # PREPARED_DIR must contain train_model_inputs.pkl (and val_model_inputs.pkl unless
 # NO_VALIDATION=1). The SMD pkls live next to this script, in SMD_run.
-PREPARED_DIR="${PREPARED_DIR:-${SCRIPT_DIR}}"                # train (& val) data = SMD_run
-OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-single-stage_SMD}"
+PREPARED_DIR="${PREPARED_DIR:-${SCRIPT_DIR}/Unified_Normal/prepared_global}"                # train (& val) data = SMD_run
+OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-single-stage_SMD_v4_unified_normal}"
 
 # Optional third dataset (full path to a .pkl). When set, it is evaluated and
 # logged every eval step exactly like validation (no weight updates), as eval_test_*.
-# TEST_DATA="${TEST_DATA:-${REPO_ROOT}/rajib_work_space/prepared_data_labeled/test_model_inputs.pkl}" # test data, ignored if set empty
+# TEST_DATA="${TEST_DATA:-${REPO_ROOT}/rajib_work_space/prepared_data_labeled/test_model_inputs.pkl}" # test data, --significant portion of train data; ignored if set empty
+
 TEST_DATA="${TEST_DATA:-}"
 # Model
 MODEL_ID="${MODEL_ID:-amazon/chronos-2}"

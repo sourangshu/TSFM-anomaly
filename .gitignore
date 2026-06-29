@@ -3,10 +3,21 @@ __pycache__/
 
 # Pickle files
 *.pkl
+*.npz
+*.png
+*.txt
+*.csv
 
-# Log folders
+# Log files and folders
+*.log
 **/log/
 **/logs/
+
+# Model checkpoints (training artifacts, should not be uploaded)
+**/chronos2-single-stage_*/
+**/checkpoint-*/
+**/finetuned-ckpt/
+**/checkpoints/
 
 # Specific large model folders
 Chronos_Finetuning/rajib_work_space/chronos2-single-stage_NS1000_V5/
