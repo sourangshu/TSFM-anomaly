@@ -7,6 +7,7 @@ __pycache__/
 *.png
 *.txt
 *.csv
+*.npy
 
 # Log files and folders
 *.log
