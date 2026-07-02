@@ -191,6 +191,16 @@ class Chronos2Encoder(nn.Module):
 class Chronos2Output(ModelOutput):
     loss: torch.Tensor | None = None
     mse: torch.Tensor | None = None
+    # Per-step pinball loss (summed over quantiles), shape (batch, horizon), with the
+    # loss_mask already applied. Reducing it as `mean(dim=-1)` reproduces `loss`
+    # exactly. Exposed so downstream trainers can apply per-step (masked) objectives;
+    # None when no future_target is provided. Additive/optional — no effect on
+    # existing callers that only read `loss`.
+    per_step_loss: torch.Tensor | None = None
+    # Per-step squared error of the mean prediction, shape (batch, horizon), with the
+    # loss_mask applied (masked steps = 0). Lets trainers report per-step MSE split by
+    # a step-level label. None when no future_target is provided. Additive/optional.
+    per_step_mse: torch.Tensor | None = None
     quantile_preds: torch.Tensor | None = None
     enc_time_self_attn_weights: tuple[torch.Tensor, ...] | None = None
     enc_group_self_attn_weights: tuple[torch.Tensor, ...] | None = None
@@ -562,6 +572,10 @@ class Chronos2Model(PreTrainedModel):
         # the first components masks any missing targets and the second component masks known future values
         loss_mask = future_target_mask.float() * inv_future_covariate_mask
         loss = quantile_loss * loss_mask
+        # Per-step loss: sum over quantile levels only, keep the horizon axis.
+        # Shape (batch, horizon). mean(dim=-1) of this equals the scalar `loss` below,
+        # so downstream per-step objectives stay on the same scale as `loss`.
+        per_step_loss = loss.sum(dim=1)                               # (b, T)
         # mean over prediction horizon, sum over quantile levels and mean over batch
         # print(f"------------------loss shape: {loss.shape}------------------")
         loss = loss.mean(dim=-1).sum(dim=-1).mean()
@@ -573,9 +587,11 @@ class Chronos2Model(PreTrainedModel):
         # mean only over *valid* (unmasked) positions to avoid bias from padding/missing values
         num_valid = loss_mask.sum().clamp(min=1)                      # scalar, avoid /0
         mse = masked_sq_errors.sum() / num_valid                      # scalar
+        # Per-step squared error (drop the singleton quantile-mean axis). Shape (b, T).
+        per_step_mse = masked_sq_errors.sum(dim=1)                    # (b, T)
         # ─────────────────────────────────────────────────────────────────────────
 
-        return loss,mse
+        return loss, mse, per_step_loss, per_step_mse
 
     def encode(
         self,
@@ -776,7 +792,7 @@ class Chronos2Model(PreTrainedModel):
             p=self.chronos_config.output_patch_size,
         )
 
-        loss, mse = (
+        loss, mse, per_step_loss, per_step_mse = (
             self._compute_loss(
                 quantile_preds=quantile_preds,
                 future_target=future_target,
@@ -786,7 +802,7 @@ class Chronos2Model(PreTrainedModel):
                 num_output_patches=num_output_patches,
             )
             if future_target is not None
-            else (None, None)
+            else (None, None, None, None)
         )
 
         # Unscale predictions
@@ -808,6 +824,8 @@ class Chronos2Model(PreTrainedModel):
         return Chronos2Output(
             loss=loss,
             mse = mse,
+            per_step_loss=per_step_loss,
+            per_step_mse=per_step_mse,
             quantile_preds=quantile_preds,
             enc_time_self_attn_weights=encoder_outputs.all_time_self_attn_weights,
             enc_group_self_attn_weights=encoder_outputs.all_group_self_attn_weights,

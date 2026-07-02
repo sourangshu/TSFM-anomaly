@@ -64,9 +64,12 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
 
     def __init__(self, inputs, *args, **kwargs):
         future_types = [int(d.get("future_type", 0)) for d in inputs]
+        # Per-timestep labels (length = prediction_length), 0=normal / 1=anomaly.
+        # These drive the per-step masked loss; the window-level future_type is kept
+        # only for backward-compatible logging.
+        future_labels = [np.asarray(d["future_labels"], dtype=np.int64) for d in inputs]
         # Strip BOTH our extra keys before the parent's validation: `future_type`
-        # (the window-level label) and `future_labels` (the per-timestep array the
-        # labeled data prep emits, already collapsed into future_type upstream).
+        # (the window-level label) and `future_labels` (the per-timestep array).
         cleaned = [
             {k: v for k, v in d.items() if k not in ("future_type", "future_labels")}
             for d in inputs
@@ -81,28 +84,26 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
                 f"{len(self.inputs)} survived length filtering. Ensure every target is "
                 "at least min_past + prediction_length steps long."
             )
-        
 
-        for prepared, ft in zip(self.inputs, future_types):
+        for prepared, ft, fl in zip(self.inputs, future_types, future_labels):
             prepared["future_type"] = ft
-        
-        # print("---------------Monkey patching worked-----------------")
+            prepared["future_labels"] = fl
 
     def _build_batch(self, input_indices):
-        # print("-----------Called -build_batch ---")
         batch = super()._build_batch(input_indices)
 
         row_future_types = []
+        row_future_labels = []
         for input_idx in input_indices:
             group_size = self.inputs[input_idx]["context"].shape[0]
+            # One window-level label / one (P,) per-step array, replicated across the
+            # window's group_size channel rows so they line up with future_target.
             row_future_types.extend([self.inputs[input_idx]["future_type"]] * group_size)
+            row_future_labels.extend([self.inputs[input_idx]["future_labels"]] * group_size)
         batch["future_type"] = torch.tensor(row_future_types, dtype=torch.long)
-
-
-        # print(f"---Batch {batch.keys()}")
-        # print(batch['context'].shape)
-        # print(batch['future_target'].shape)
-        # print(batch['future_type'].shape)
+        batch["future_labels"] = torch.as_tensor(
+            np.stack(row_future_labels), dtype=torch.long
+        )  # (rows, prediction_length)
 
         return batch
 
@@ -113,27 +114,41 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
 
 class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
     """
-    Single-stage trainer using a margin (hinge) objective on future_type per sample.
+    Single-stage trainer using a PER-STEP masked margin (hinge) objective.
 
-        L_total = L_good + lambda * max(0, tau - L_bad)
+        L = L_good + lambda * max(0, tau - L_bad)
 
-      - L_good : mean loss on normal-future samples  (future_type==0) -> minimised
-      - L_bad  : mean loss on anomaly-future samples (future_type==1) -> pushed UP,
-                 but only until it reaches the margin `tau`. Once L_bad >= tau the
-                 hinge is 0 and stops contributing gradient (self-saturating, so no
-                 divergence — this replaces the old loss_ceiling clamp+negate hack).
+    Instead of collapsing each window to one good/bad bit via a count threshold, the
+    per-timestep labels (`future_labels`, 0=normal / 1=anomaly) mask the model's
+    per-step pinball loss (`Chronos2Output.per_step_loss`, shape (rows, horizon)):
 
-    The two sub-batches are forwarded separately so L_good and L_bad are independent.
+      - L_good : mean per-step loss over NORMAL steps  -> minimised
+      - L_bad  : mean per-step loss over ANOMALY steps -> pushed UP toward margin tau
+                 (self-saturating hinge: no gradient once L_bad >= tau).
+
+    This removes both contaminations — no normal step is ever pushed up, no anomaly
+    step is ever trained as normal — and makes the count threshold unnecessary.
+    A SINGLE forward pass over the whole batch is used; the split is by step, not by
+    window, so both terms come from the same predictions.
+
+    Aggregation (`agg_mode`) controls how the masked means are pooled:
+      - "batch_global": pool ALL normal steps in the batch for one L_good and ALL
+        anomaly steps for one L_bad, with a single hinge. Each *step* weighted equally
+        (longer/denser windows contribute more); most stable across datasets.
+      - "per_window": compute L_good_w / L_bad_w within each window, form
+        L_w = L_good_w + lambda*hinge(tau - L_bad_w) per window, then average over
+        windows. Each *window* weighted equally regardless of step count.
 
     Parameters
     ----------
     margin_tau : float
-        The margin the anomaly loss is pushed toward. Must sit ABOVE the normal-point
-        loss to do anything. The Chronos-2 loss sums pinball loss over 9 quantiles, so
-        even well-predicted normal points score ~3-4 on the normalized scale — set tau
-        to ~2-4x that (e.g. 10-15), NOT 2.
+        Margin the anomaly loss is pushed toward. Per-step loss (summed over 9
+        quantiles) sits on the same scale as the old per-window loss (~3-4 for
+        well-predicted normal steps), so tau ~10-15 as before.
     margin_lambda : float
         Weight on the anomaly (bad) term. 1.0 is a sensible default.
+    agg_mode : str
+        "batch_global" (default) or "per_window".
     """
 
     def __init__(
@@ -141,23 +156,29 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
         *args,
         margin_tau: float = 12.0,
         margin_lambda: float = 1.0,
+        agg_mode: str = "batch_global",
         loss_ceiling: float | None = None,  # accepted for back-compat; unused by hinge
         **kwargs,
     ):
-        # print("---------------------Chronos2SingleStageTrainer------------------")
         super().__init__(*args, loss_ceiling=loss_ceiling, **kwargs)
+        if agg_mode not in ("batch_global", "per_window"):
+            raise ValueError(
+                f"agg_mode must be 'batch_global' or 'per_window', got {agg_mode!r}"
+            )
         self.margin_tau = margin_tau
         self.margin_lambda = margin_lambda
-        # Running (sample-weighted) sums of the RAW per-future-type losses, so we can
-        # log normal_loss / anomaly_loss (pinball) and mse_normal_window /
-        # mse_anomalous_window (MSE) separately. Train and eval are kept apart.
-        # *_sum  -> pinball loss, *_mse_sum -> mse, both weighted by the row count.
-        self._acc = {
-            "train": {"n_sum": 0.0, "n_mse_sum": 0.0, "n_cnt": 0,
-                      "a_sum": 0.0, "a_mse_sum": 0.0, "a_cnt": 0},
-            "eval":  {"n_sum": 0.0, "n_mse_sum": 0.0, "n_cnt": 0,
-                      "a_sum": 0.0, "a_mse_sum": 0.0, "a_cnt": 0},
-        }
+        self.agg_mode = agg_mode
+        # Running sums of the RAW per-step metrics, split by step label, so we can log
+        # normal/anomaly means separately for monitoring:
+        #   *_sum     -> summed pinball loss   -> normal_loss / anomaly_loss
+        #   *_mse_sum -> summed squared error  -> mse_normal_step / mse_anomaly_step
+        #   *_cnt     -> number of steps (shared denominator for both)
+        # Train and eval kept apart.
+        def _fresh():
+            return {"n_sum": 0.0, "n_mse_sum": 0.0, "n_cnt": 0,
+                    "a_sum": 0.0, "a_mse_sum": 0.0, "a_cnt": 0}
+        self._acc = {"train": _fresh(), "eval": _fresh()}
+        self._fresh_acc = _fresh
 
 
     @staticmethod
@@ -169,52 +190,54 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
         }
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # print("---Compute_loss() ours'-----------")
-        # print(f'inputs context shape is {inputs["context"].shape}')
-        # print(f'inputs future_target shape is {inputs["future_target"].shape}')
-        # print(f'inputs future_type shape is {inputs["future_type"].shape}')
-        future_type = inputs.pop("future_type")   # (B,) — not passed to model
-        normal_mask  = future_type == 0
-        anomaly_mask = future_type == 1
-        # print(f"Normal mask shape: {normal_mask.shape}, Anomaly mask shape: {anomaly_mask.shape}")
-        n_normal  = normal_mask.sum().item()
-        n_anomaly = anomaly_mask.sum().item()
-        # print(f"Batch: {n_normal} normal, {n_anomaly} anomaly")
-       
-        outputs = None
+        # future_type is kept only for back-compat; the per-step objective uses
+        # future_labels. Neither is passed to the model.
+        inputs.pop("future_type", None)
+        future_labels = inputs.pop("future_labels")        # (rows, P) long, 0/1
+
+        outputs = model(**inputs)
+        # (rows, T) per-step pinball loss (summed over quantiles), loss_mask applied.
+        P = future_labels.shape[1]
+        per_step = outputs.per_step_loss[:, :P]            # trim any horizon padding
+        per_step_mse = outputs.per_step_mse[:, :P]         # per-step squared error
+        labels = future_labels.to(per_step.device)
+
+        normal_step = (labels == 0).float()                # (rows, P)
+        anomaly_step = (labels == 1).float()
+
         acc = self._acc["train" if model.training else "eval"]
+        # Accumulate pooled per-step means for monitoring (pinball + MSE), split by
+        # step label. Informative regardless of agg_mode.
+        n_norm_steps = normal_step.sum()
+        n_anom_steps = anomaly_step.sum()
+        acc["n_sum"] += (per_step * normal_step).sum().detach().item()
+        acc["n_mse_sum"] += (per_step_mse * normal_step).sum().detach().item()
+        acc["n_cnt"] += int(n_norm_steps.item())
+        acc["a_sum"] += (per_step * anomaly_step).sum().detach().item()
+        acc["a_mse_sum"] += (per_step_mse * anomaly_step).sum().detach().item()
+        acc["a_cnt"] += int(n_anom_steps.item())
 
-        # ── Normal sub-batch → L_good (minimise) ─────────────────────────────
-        L_good = torch.zeros((), device=future_type.device)
-        if n_normal > 0:
-            normal_out = model(**self._select(inputs, normal_mask))
-            L_good = normal_out.loss
-            outputs = normal_out
-            acc["n_sum"] += L_good.detach().item() * n_normal
-            if normal_out.mse is not None:
-                acc["n_mse_sum"] += normal_out.mse.detach().item() * n_normal
-            acc["n_cnt"] += n_normal
+        eps = 1.0  # clamp denominators to avoid /0 on empty subsets
 
-        # ── Anomaly sub-batch → L_bad (push UP toward the margin tau) ─────────
-        L_bad = None
-        if n_anomaly > 0:
-            anom_out = model(**self._select(inputs, anomaly_mask))
-            L_bad = anom_out.loss
-            # Log the RAW prediction error on anomaly futures — we want this to go UP.
-            acc["a_sum"] += L_bad.detach().item() * n_anomaly
-            if anom_out.mse is not None:
-                acc["a_mse_sum"] += anom_out.mse.detach().item() * n_anomaly
-            acc["a_cnt"] += n_anomaly
-            if outputs is None:
-                outputs = anom_out
-
-        # ── Combine: L_total = L_good + lambda * max(0, tau - L_bad) ──────────
-        # The hinge is active only while L_bad < tau; once the anomaly loss clears
-        # the margin it contributes no gradient, so training cannot diverge.
-        total_loss = L_good
-        if L_bad is not None:
-            hinge = torch.clamp(self.margin_tau - L_bad, min=0.0)
-            total_loss = total_loss + self.margin_lambda * hinge
+        if self.agg_mode == "batch_global":
+            # Pool every step in the batch: each step weighted equally.
+            L_good = (per_step * normal_step).sum() / n_norm_steps.clamp(min=eps)
+            total_loss = L_good
+            if n_anom_steps > 0:
+                L_bad = (per_step * anomaly_step).sum() / n_anom_steps.clamp(min=eps)
+                hinge = torch.clamp(self.margin_tau - L_bad, min=0.0)
+                total_loss = total_loss + self.margin_lambda * hinge
+        else:  # per_window
+            # Masked means within each window, then average over windows.
+            cnt_norm_w = normal_step.sum(dim=1)                       # (rows,)
+            cnt_anom_w = anomaly_step.sum(dim=1)
+            L_good_w = (per_step * normal_step).sum(dim=1) / cnt_norm_w.clamp(min=eps)
+            L_bad_w  = (per_step * anomaly_step).sum(dim=1) / cnt_anom_w.clamp(min=eps)
+            has_norm = (cnt_norm_w > 0).float()
+            has_anom = (cnt_anom_w > 0).float()
+            hinge_w = torch.clamp(self.margin_tau - L_bad_w, min=0.0) * has_anom
+            per_window = L_good_w * has_norm + self.margin_lambda * hinge_w
+            total_loss = per_window.mean()
 
         return (total_loss, outputs) if return_outputs else total_loss
 
@@ -245,20 +268,19 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
 
         if acc["n_cnt"] > 0:
             logs[f"{prefix}normal_loss"] = round(acc["n_sum"] / acc["n_cnt"], 4)
-            logs[f"{prefix}mse_normal_window"] = round(acc["n_mse_sum"] / acc["n_cnt"], 4)
+            logs[f"{prefix}mse_normal_step"] = round(acc["n_mse_sum"] / acc["n_cnt"], 4)
         if acc["a_cnt"] > 0:
             logs[f"{prefix}anomaly_loss"] = round(acc["a_sum"] / acc["a_cnt"], 4)
-            logs[f"{prefix}mse_anomalous_window"] = round(acc["a_mse_sum"] / acc["a_cnt"], 4)
+            logs[f"{prefix}mse_anomaly_step"] = round(acc["a_mse_sum"] / acc["a_cnt"], 4)
 
         if phase == "eval":
             tag = prefix.rstrip("_").upper()  # "EVAL" / "EVAL_VAL" / "EVAL_TEST"
             print(f"\n======================================================")
-            print(f" [{tag}] Normal Loss: {logs.get(f'{prefix}normal_loss', 'N/A')} | Anomaly Loss: {logs.get(f'{prefix}anomaly_loss', 'N/A')}")
-            print(f"              MSE Normal:  {logs.get(f'{prefix}mse_normal_window', 'N/A')} | MSE Anomalous: {logs.get(f'{prefix}mse_anomalous_window', 'N/A')}")
+            print(f" [{tag}] Normal step loss: {logs.get(f'{prefix}normal_loss', 'N/A')} | Anomaly step loss: {logs.get(f'{prefix}anomaly_loss', 'N/A')}")
+            print(f"              MSE Normal step: {logs.get(f'{prefix}mse_normal_step', 'N/A')} | MSE Anomaly step: {logs.get(f'{prefix}mse_anomaly_step', 'N/A')}")
             print(f"======================================================\n", flush=True)
 
-        self._acc[phase] = {"n_sum": 0.0, "n_mse_sum": 0.0, "n_cnt": 0,
-                            "a_sum": 0.0, "a_mse_sum": 0.0, "a_cnt": 0}
+        self._acc[phase] = self._fresh_acc()
         out = super().log(logs, *args, **kwargs)
         # Persist the loss history every logging step. Without this, runs with
         # save_strategy="no" (i.e. --no_validation) never write trainer_state.json
@@ -335,6 +357,12 @@ def parse_args():
                         "normal-point loss (~3-4 here) to matter — use ~10-15, NOT 2.")
     p.add_argument("--margin_lambda", type=float, default=1.0,
                    help="Weight on the anomaly (bad) term. Default 1.0.")
+    p.add_argument("--agg_mode", default="batch_global",
+                   choices=["batch_global", "per_window"],
+                   help="How to pool the per-step masked losses. 'batch_global' pools "
+                        "all steps (each step weighted equally, most stable across "
+                        "datasets); 'per_window' averages per-window means (each window "
+                        "weighted equally).")
 
     # Output
     p.add_argument("--output_dir", default="./chronos2-single-stage")
@@ -475,6 +503,7 @@ def main():
             Chronos2SingleStageTrainer,
             margin_tau=args.margin_tau,
             margin_lambda=args.margin_lambda,
+            agg_mode=args.agg_mode,
         ),
     )
     if val_data is not None:
@@ -504,8 +533,8 @@ def main():
     chronos2_pipeline.Chronos2Dataset = AnomalyChronos2Dataset
 
     logger.info(
-        f"Single-stage training: lr={args.lr}, steps={args.num_steps}, "
-        f"batch={args.batch_size}, margin_tau={args.margin_tau}, "
+        f"Single-stage per-step masked training: lr={args.lr}, steps={args.num_steps}, "
+        f"batch={args.batch_size}, agg_mode={args.agg_mode}, margin_tau={args.margin_tau}, "
         f"margin_lambda={args.margin_lambda}, fp16={use_fp16}"
     )
     # print("----------------Calling pipeline_fit from main()---------------")

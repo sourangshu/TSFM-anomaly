@@ -26,7 +26,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"      # .../Unified_Normal
 
 # ── Configuration — edit here or export before running ────────────────────────
-DATA_DIR="${DATA_DIR:-/home/rajib/mTSBench/Datasets/mTSBench/SMD}"
+# DATA_DIR="${DATA_DIR:-/home/rajib/mTSBench/Datasets/mTSBench/SMD}"
+DATA_DIR="${DATA_DIR:-/mnt/c/Files/MTP Code Local Files/MTP_SEM_3_LOCAL_FILES/mTSBench/SMD}"
+
 OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/prepared_global}"
 REFERENCE="${REFERENCE:-auto}"               # 'auto' = derive dataset medoid; or a filename substring
 METRIC="${METRIC:-fft}"                       # similarity for 'auto' medoid: fft (phase-robust) | pearson
