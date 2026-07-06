@@ -7,9 +7,9 @@ python create_test_data.py
 
 import pickle
 
-TRAIN_DATA_PATH = '/mnt/c/Files/MTP Code Local Files/SB_dir/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_MaskLoss/prepared_50_50/train_model_inputs.pkl'
+TRAIN_DATA_PATH = '/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_MaskLoss/prepared_50_50/train_model_inputs.pkl'
 
-TEST_DATA_PATH = '/mnt/c/Files/MTP Code Local Files/SB_dir/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_MaskLoss/prepared_50_50/EVAL_TEST.pkl'
+TEST_DATA_PATH = '/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_MaskLoss/prepared_50_50/EVAL_TEST.pkl'
 
 
 # Open the file in read-binary mode and load the data

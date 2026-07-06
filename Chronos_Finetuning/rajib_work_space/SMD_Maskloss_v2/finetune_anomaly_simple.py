@@ -1,23 +1,34 @@
 """
-Single-stage anomaly-aware fine-tuning for Chronos-2.
+Single-stage anomaly-aware fine-tuning for Chronos-2  (maskloss v2).
 
 Uses a SINGLE combined dataset (normal + anomaly future pairs mixed together).
-The loss is a margin (hinge) objective conditioned on the future type of each sample:
+The loss is a PER-STEP masked margin (hinge) objective; per-timestep labels
+(future_labels, 0=normal / 1=anomaly) mask the model's per-step pinball loss:
 
-    L_total = L_good + lambda * max(0, tau - L_bad)
+    L_total = L_good + lambda * L_bad_term
 
-    future_type == 0  (normal)  →  L_good : minimise (predict normal well)
-    future_type == 1  (anomaly) →  L_bad  : push UP toward margin tau, then stop
+    normal steps  (label 0) →  L_good     : minimise (predict normal well)
+    anomaly steps (label 1) →  L_bad_term : push UP toward a margin, then saturate
 
-The hinge self-saturates: once L_bad >= tau it adds no gradient, so training can't
-diverge (this replaces the old clamp+negate gradient-ascent ceiling).
+v2 folds in three team suggestions (all off-able via CLI to recover v1 behaviour):
+
+  1. hinge_mode=per_step  — hinge EACH anomaly step, max(0, margin - per_step_i),
+     then average, instead of hinging only the pooled mean. Every anomalous
+     timestep is pushed (VUS is per-timestep), so a few huge-error steps can't
+     satisfy the margin on behalf of the rest.
+  2. margin_mode=relative — margin = margin_m * L_good_w.detach() per window, so the
+     bad target self-scales to each SMD machine's own normal error instead of a
+     fixed tau that over-pushes quiet series and is pre-satisfied on busy ones.
+  3. --anomaly_frac       — oversample anomaly windows in the train sampler so every
+     batch carries a bad-term gradient (only ~4.7% of SMD train windows are anomalous).
 
 At inference: high prediction error ⟹ high anomaly score.
 
 Usage:
-    python finetune_anomaly_simple.py
-    python finetune_anomaly_simple.py --margin_tau 12 --margin_lambda 1.0
-    python finetune_anomaly_simple.py --finetune_mode full --lr 1e-6
+    python finetune_anomaly_simple.py                                  # v2 defaults
+    python finetune_anomaly_simple.py --margin_mode relative --margin_m 2.5
+    python finetune_anomaly_simple.py --hinge_mode pooled --margin_mode absolute \
+        --margin_tau 13 --anomaly_frac 0                               # v1 behaviour
 """
 
 import argparse
@@ -60,7 +71,20 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
     onto every batch the dataset yields — expanded to one entry per row so it lines
     up with `context`/`future_target`/`group_ids` (each input series contributes
     `group_size` rows). The single-stage trainer pops it back off in compute_loss.
+
+    Anomaly oversampling (Suggestion 3)
+    -----------------------------------
+    Only ~4.7% of SMD train windows contain anomalies, so with uniform sampling most
+    optimizer steps never see an anomaly step and the margin (bad) term gets no
+    gradient. The class attribute `anomaly_frac` (set from --anomaly_frac before
+    fit) biases `_generate_train_batches` so that a target fraction of the windows
+    drawn into each micro-batch are anomalous (future_type==1). `anomaly_frac <= 0`
+    restores the original uniform sampling.
     """
+
+    # Target fraction of anomaly windows per train batch. 0 => uniform (original).
+    # Set on the class from main() before pipeline.fit() instantiates the dataset.
+    anomaly_frac: float = 0.0
 
     def __init__(self, inputs, *args, **kwargs):
         future_types = [int(d.get("future_type", 0)) for d in inputs]
@@ -89,6 +113,47 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
             prepared["future_type"] = ft
             prepared["future_labels"] = fl
 
+        # Index pools for optional anomaly oversampling in _generate_train_batches.
+        ftypes = np.asarray(
+            [self.inputs[i]["future_type"] for i in range(len(self.inputs))]
+        )
+        self._anom_idx = np.nonzero(ftypes == 1)[0]
+        self._norm_idx = np.nonzero(ftypes == 0)[0]
+        logger.info(
+            f"AnomalyChronos2Dataset: {len(self._anom_idx)} anomaly / "
+            f"{len(self._norm_idx)} normal windows "
+            f"({100.0 * len(self._anom_idx) / max(len(self.inputs), 1):.1f}% anomalous); "
+            f"anomaly_frac={type(self).anomaly_frac}"
+        )
+
+    def _generate_train_batches(self):
+        """Same as the parent, but optionally oversamples anomaly windows.
+
+        When `anomaly_frac > 0`, each window drawn into the micro-batch is chosen from
+        the anomaly pool with probability `anomaly_frac` and from the normal pool
+        otherwise, so (in expectation) that fraction of every batch is anomalous and
+        the margin term always receives gradient. Falls back to the original uniform
+        `np.random.randint` sampling when disabled or when either pool is empty.
+        """
+        frac = float(type(self).anomaly_frac)
+        use_weighted = (
+            frac > 0.0 and len(self._anom_idx) > 0 and len(self._norm_idx) > 0
+        )
+        while True:
+            current_batch_size = 0
+            input_indices = []
+
+            while current_batch_size < self.batch_size:
+                if use_weighted:
+                    pool = self._anom_idx if np.random.random() < frac else self._norm_idx
+                    input_idx = int(np.random.choice(pool))
+                else:
+                    input_idx = np.random.randint(len(self.inputs))
+                input_indices.append(input_idx)
+                current_batch_size += self.inputs[input_idx]["context"].shape[0]
+
+            yield self._build_batch(input_indices)
+
     def _build_batch(self, input_indices):
         batch = super()._build_batch(input_indices)
 
@@ -116,35 +181,53 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
     """
     Single-stage trainer using a PER-STEP masked margin (hinge) objective.
 
-        L = L_good + lambda * max(0, tau - L_bad)
+        L = L_good + lambda * L_bad_term
 
-    Instead of collapsing each window to one good/bad bit via a count threshold, the
-    per-timestep labels (`future_labels`, 0=normal / 1=anomaly) mask the model's
+    The per-timestep labels (`future_labels`, 0=normal / 1=anomaly) mask the model's
     per-step pinball loss (`Chronos2Output.per_step_loss`, shape (rows, horizon)):
 
       - L_good : mean per-step loss over NORMAL steps  -> minimised
-      - L_bad  : mean per-step loss over ANOMALY steps -> pushed UP toward margin tau
-                 (self-saturating hinge: no gradient once L_bad >= tau).
+      - L_bad_term : hinge pushing ANOMALY-step loss UP toward a margin
+                     (self-saturating: no gradient once a step clears its margin).
 
-    This removes both contaminations — no normal step is ever pushed up, no anomaly
-    step is ever trained as normal — and makes the count threshold unnecessary.
-    A SINGLE forward pass over the whole batch is used; the split is by step, not by
-    window, so both terms come from the same predictions.
+    Two knobs shape the bad term, following the team's suggestions:
 
-    Aggregation (`agg_mode`) controls how the masked means are pooled:
-      - "batch_global": pool ALL normal steps in the batch for one L_good and ALL
-        anomaly steps for one L_bad, with a single hinge. Each *step* weighted equally
-        (longer/denser windows contribute more); most stable across datasets.
-      - "per_window": compute L_good_w / L_bad_w within each window, form
-        L_w = L_good_w + lambda*hinge(tau - L_bad_w) per window, then average over
-        windows. Each *window* weighted equally regardless of step count.
+    hinge_mode (Suggestion 1 — hinge each step, not the pooled mean)
+      - "per_step" (default): L_bad_term = mean over anomaly steps of
+        max(0, margin - per_step_i). Every anomalous timestep is pushed
+        individually, so a few huge-error steps can no longer satisfy the margin on
+        behalf of other anomaly steps that stay well-predicted (the false negatives
+        at inference, since VUS is per-timestep).
+      - "pooled" (original): hinge the *mean* anomaly loss, max(0, margin - L_bad).
+
+    margin_mode (Suggestion 2 — relative, not absolute, margin)
+      - "relative" (default): margin = margin_m * L_good_w.detach(), i.e. per window
+        the anomaly error must be margin_m x that window's OWN normal error. This
+        self-scales across quiet (loss ~0.1) and busy (loss ~4+) SMD machines, which
+        instance-norm does not equalize, so a fixed tau no longer over-pushes quiet
+        series while being already-satisfied on noisy ones.
+      - "absolute" (original): margin = margin_tau, a fixed constant.
+
+    Aggregation (`agg_mode`) controls how the masked losses are pooled:
+      - "batch_global" (default): pool all steps in the batch (each *step* weighted
+        equally; longer/denser windows contribute more). Most stable across datasets.
+      - "per_window": reduce within each window, then average over windows (each
+        *window* weighted equally regardless of step count).
+
+    A SINGLE forward pass over the whole batch is used; the normal/anomaly split is by
+    step, not by window, so both terms come from the same predictions.
 
     Parameters
     ----------
+    hinge_mode : str
+        "per_step" (default) or "pooled".
+    margin_mode : str
+        "relative" (default) or "absolute".
+    margin_m : float
+        Relative-margin multiplier (used when margin_mode="relative"). ~2-3.
     margin_tau : float
-        Margin the anomaly loss is pushed toward. Per-step loss (summed over 9
-        quantiles) sits on the same scale as the old per-window loss (~3-4 for
-        well-predicted normal steps), so tau ~10-15 as before.
+        Absolute margin (used when margin_mode="absolute"). Per-step loss (summed over
+        quantiles) sits ~3-4 for well-predicted normal steps, so tau ~10-15.
     margin_lambda : float
         Weight on the anomaly (bad) term. 1.0 is a sensible default.
     agg_mode : str
@@ -157,6 +240,9 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
         margin_tau: float = 12.0,
         margin_lambda: float = 1.0,
         agg_mode: str = "batch_global",
+        hinge_mode: str = "per_step",
+        margin_mode: str = "relative",
+        margin_m: float = 2.5,
         loss_ceiling: float | None = None,  # accepted for back-compat; unused by hinge
         **kwargs,
     ):
@@ -165,18 +251,33 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
             raise ValueError(
                 f"agg_mode must be 'batch_global' or 'per_window', got {agg_mode!r}"
             )
+        if hinge_mode not in ("per_step", "pooled"):
+            raise ValueError(
+                f"hinge_mode must be 'per_step' or 'pooled', got {hinge_mode!r}"
+            )
+        if margin_mode not in ("relative", "absolute"):
+            raise ValueError(
+                f"margin_mode must be 'relative' or 'absolute', got {margin_mode!r}"
+            )
         self.margin_tau = margin_tau
         self.margin_lambda = margin_lambda
         self.agg_mode = agg_mode
+        self.hinge_mode = hinge_mode
+        self.margin_mode = margin_mode
+        self.margin_m = margin_m
         # Running sums of the RAW per-step metrics, split by step label, so we can log
         # normal/anomaly means separately for monitoring:
         #   *_sum     -> summed pinball loss   -> normal_loss / anomaly_loss
         #   *_mse_sum -> summed squared error  -> mse_normal_step / mse_anomaly_step
         #   *_cnt     -> number of steps (shared denominator for both)
+        #   a_active_sum -> anomaly steps still BELOW their margin (hinge active); its
+        #                   ratio to a_cnt shows how much of the bad term still has
+        #                   gradient (near 0 => margin already satisfied everywhere).
         # Train and eval kept apart.
         def _fresh():
             return {"n_sum": 0.0, "n_mse_sum": 0.0, "n_cnt": 0,
-                    "a_sum": 0.0, "a_mse_sum": 0.0, "a_cnt": 0}
+                    "a_sum": 0.0, "a_mse_sum": 0.0, "a_cnt": 0,
+                    "a_active_sum": 0.0}
         self._acc = {"train": _fresh(), "eval": _fresh()}
         self._fresh_acc = _fresh
 
@@ -205,40 +306,77 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
         normal_step = (labels == 0).float()                # (rows, P)
         anomaly_step = (labels == 1).float()
 
-        acc = self._acc["train" if model.training else "eval"]
-        # Accumulate pooled per-step means for monitoring (pinball + MSE), split by
-        # step label. Informative regardless of agg_mode.
+        eps = 1.0  # clamp denominators to avoid /0 on empty subsets
+
+        # Per-window / batch step counts and presence masks.
+        cnt_norm_w = normal_step.sum(dim=1)                # (rows,)
+        cnt_anom_w = anomaly_step.sum(dim=1)
+        has_norm = (cnt_norm_w > 0).float()
+        has_anom = (cnt_anom_w > 0).float()
         n_norm_steps = normal_step.sum()
         n_anom_steps = anomaly_step.sum()
+
+        # Per-window NORMAL reference loss (detached) — the "own normal error" that the
+        # relative margin scales (Suggestion 2). Also reused as L_good_w below.
+        L_good_w = (per_step * normal_step).sum(dim=1) / cnt_norm_w.clamp(min=eps)
+
+        # Effective per-step target margin, broadcastable to (rows, P):
+        #   relative -> margin_m * L_good_w.detach()  (per window)
+        #   absolute -> margin_tau                    (scalar)
+        if self.margin_mode == "relative":
+            margin_eff = (self.margin_m * L_good_w.detach()).unsqueeze(1)   # (rows, 1)
+        else:
+            margin_eff = per_step.new_full((), float(self.margin_tau))      # scalar
+
+        # ── Monitoring accumulation (pinball + MSE + active-hinge fraction) ─────────
+        acc = self._acc["train" if model.training else "eval"]
         acc["n_sum"] += (per_step * normal_step).sum().detach().item()
         acc["n_mse_sum"] += (per_step_mse * normal_step).sum().detach().item()
         acc["n_cnt"] += int(n_norm_steps.item())
         acc["a_sum"] += (per_step * anomaly_step).sum().detach().item()
         acc["a_mse_sum"] += (per_step_mse * anomaly_step).sum().detach().item()
         acc["a_cnt"] += int(n_anom_steps.item())
+        with torch.no_grad():
+            # anomaly steps still below their margin (hinge > 0 => gradient flowing)
+            step_active = ((margin_eff - per_step) > 0).float() * anomaly_step
+            acc["a_active_sum"] += step_active.sum().item()
 
-        eps = 1.0  # clamp denominators to avoid /0 on empty subsets
-
+        # ── L_good : minimise normal-step loss ─────────────────────────────────────
         if self.agg_mode == "batch_global":
-            # Pool every step in the batch: each step weighted equally.
             L_good = (per_step * normal_step).sum() / n_norm_steps.clamp(min=eps)
-            total_loss = L_good
-            if n_anom_steps > 0:
-                L_bad = (per_step * anomaly_step).sum() / n_anom_steps.clamp(min=eps)
-                hinge = torch.clamp(self.margin_tau - L_bad, min=0.0)
-                total_loss = total_loss + self.margin_lambda * hinge
-        else:  # per_window
-            # Masked means within each window, then average over windows.
-            cnt_norm_w = normal_step.sum(dim=1)                       # (rows,)
-            cnt_anom_w = anomaly_step.sum(dim=1)
-            L_good_w = (per_step * normal_step).sum(dim=1) / cnt_norm_w.clamp(min=eps)
-            L_bad_w  = (per_step * anomaly_step).sum(dim=1) / cnt_anom_w.clamp(min=eps)
-            has_norm = (cnt_norm_w > 0).float()
-            has_anom = (cnt_anom_w > 0).float()
-            hinge_w = torch.clamp(self.margin_tau - L_bad_w, min=0.0) * has_anom
-            per_window = L_good_w * has_norm + self.margin_lambda * hinge_w
-            total_loss = per_window.mean()
+        else:  # per_window: mean of per-window normal means over windows with normals
+            L_good = (L_good_w * has_norm).sum() / has_norm.sum().clamp(min=eps)
 
+        # ── L_bad_term : push anomaly-step loss up toward the margin ───────────────
+        if self.hinge_mode == "per_step":
+            # Suggestion 1: hinge EACH anomaly step, then average over anomaly steps.
+            step_hinge = torch.clamp(margin_eff - per_step, min=0.0) * anomaly_step
+            if self.agg_mode == "batch_global":
+                L_bad_term = step_hinge.sum() / n_anom_steps.clamp(min=eps)
+            else:
+                hinge_w = step_hinge.sum(dim=1) / cnt_anom_w.clamp(min=eps)
+                L_bad_term = (hinge_w * has_anom).sum() / has_anom.sum().clamp(min=eps)
+        else:  # pooled: hinge the MEAN anomaly loss (original per-mean behaviour)
+            if self.margin_mode == "relative":
+                # Per-window margin => the mean must be taken per window.
+                L_bad_w = (per_step * anomaly_step).sum(dim=1) / cnt_anom_w.clamp(min=eps)
+                margin_w = self.margin_m * L_good_w.detach()
+                hinge_w = torch.clamp(margin_w - L_bad_w, min=0.0) * has_anom
+                if self.agg_mode == "batch_global":
+                    # weight each window by its anomaly-step count (step-equal pooling)
+                    L_bad_term = (hinge_w * cnt_anom_w).sum() / n_anom_steps.clamp(min=eps)
+                else:
+                    L_bad_term = hinge_w.sum() / has_anom.sum().clamp(min=eps)
+            else:  # absolute margin
+                if self.agg_mode == "batch_global":
+                    L_bad = (per_step * anomaly_step).sum() / n_anom_steps.clamp(min=eps)
+                    L_bad_term = torch.clamp(self.margin_tau - L_bad, min=0.0)
+                else:
+                    L_bad_w = (per_step * anomaly_step).sum(dim=1) / cnt_anom_w.clamp(min=eps)
+                    hinge_w = torch.clamp(self.margin_tau - L_bad_w, min=0.0) * has_anom
+                    L_bad_term = hinge_w.sum() / has_anom.sum().clamp(min=eps)
+
+        total_loss = L_good + self.margin_lambda * L_bad_term
         return (total_loss, outputs) if return_outputs else total_loss
 
     def log(self, logs: dict, *args, **kwargs):
@@ -272,12 +410,16 @@ class Chronos2SingleStageTrainer(Chronos2AnomalyTrainer):
         if acc["a_cnt"] > 0:
             logs[f"{prefix}anomaly_loss"] = round(acc["a_sum"] / acc["a_cnt"], 4)
             logs[f"{prefix}mse_anomaly_step"] = round(acc["a_mse_sum"] / acc["a_cnt"], 4)
+            # Fraction of anomaly steps still below their margin (hinge active). Near 0
+            # means the margin is already satisfied and the bad term has little gradient.
+            logs[f"{prefix}anomaly_active_frac"] = round(acc["a_active_sum"] / acc["a_cnt"], 4)
 
         if phase == "eval":
             tag = prefix.rstrip("_").upper()  # "EVAL" / "EVAL_VAL" / "EVAL_TEST"
             print(f"\n======================================================")
             print(f" [{tag}] Normal step loss: {logs.get(f'{prefix}normal_loss', 'N/A')} | Anomaly step loss: {logs.get(f'{prefix}anomaly_loss', 'N/A')}")
             print(f"              MSE Normal step: {logs.get(f'{prefix}mse_normal_step', 'N/A')} | MSE Anomaly step: {logs.get(f'{prefix}mse_anomaly_step', 'N/A')}")
+            print(f"              Anomaly hinge-active frac: {logs.get(f'{prefix}anomaly_active_frac', 'N/A')}")
             print(f"======================================================\n", flush=True)
 
         self._acc[phase] = self._fresh_acc()
@@ -351,9 +493,22 @@ def parse_args():
     p.add_argument("--lr_scheduler_type", default="cosine",
                    choices=["linear", "cosine", "cosine_with_restarts", "constant"])
 
-    # Margin (hinge) loss: L_good + lambda * max(0, tau - L_bad)
+    # Margin (hinge) loss: L_good + lambda * L_bad_term
+    p.add_argument("--hinge_mode", default="per_step",
+                   choices=["per_step", "pooled"],
+                   help="Suggestion 1. 'per_step' hinges EACH anomaly step then "
+                        "averages (pushes every anomalous timestep, matching per-step "
+                        "VUS); 'pooled' hinges the mean anomaly loss (original).")
+    p.add_argument("--margin_mode", default="relative",
+                   choices=["relative", "absolute"],
+                   help="Suggestion 2. 'relative' uses margin = margin_m * "
+                        "L_good_w.detach() per window (self-scales across quiet/busy "
+                        "SMD machines); 'absolute' uses the fixed margin_tau.")
+    p.add_argument("--margin_m", type=float, default=5,
+                   help="Relative-margin multiplier (margin_mode=relative). Anomaly "
+                        "error must reach margin_m x the window's own normal error. ~2-3.")
     p.add_argument("--margin_tau", type=float, default=12.0,
-                   help="Margin the anomaly loss is pushed toward. Must sit ABOVE the "
+                   help="Absolute margin (margin_mode=absolute). Must sit ABOVE the "
                         "normal-point loss (~3-4 here) to matter — use ~10-15, NOT 2.")
     p.add_argument("--margin_lambda", type=float, default=1.0,
                    help="Weight on the anomaly (bad) term. Default 1.0.")
@@ -363,6 +518,11 @@ def parse_args():
                         "all steps (each step weighted equally, most stable across "
                         "datasets); 'per_window' averages per-window means (each window "
                         "weighted equally).")
+    p.add_argument("--anomaly_frac", type=float, default=0.5,
+                   help="Suggestion 3. Target fraction of anomaly windows drawn into "
+                        "each train batch (weighted sampling). ~4.7%% of SMD train "
+                        "windows are anomalous, so 0 (uniform) starves the bad term of "
+                        "gradient. Set <=0 to disable oversampling.")
 
     # Output
     p.add_argument("--output_dir", default="./chronos2-single-stage")
@@ -474,6 +634,9 @@ def main():
             margin_tau=args.margin_tau,
             margin_lambda=args.margin_lambda,
             agg_mode=args.agg_mode,
+            hinge_mode=args.hinge_mode,
+            margin_mode=args.margin_mode,
+            margin_m=args.margin_m,
         ),
     )
     if val_data is not None:
@@ -501,11 +664,15 @@ def main():
     # pipeline.fit builds its dataset internally; swap in our subclass so that
     # per-sample future_type survives into the trainer's compute_loss.
     chronos2_pipeline.Chronos2Dataset = AnomalyChronos2Dataset
+    # Suggestion 3: bias the train sampler toward anomaly windows. The dataset is
+    # instantiated inside pipeline.fit, so pass this via the class attribute.
+    AnomalyChronos2Dataset.anomaly_frac = args.anomaly_frac
 
     logger.info(
         f"Single-stage per-step masked training: lr={args.lr}, steps={args.num_steps}, "
-        f"batch={args.batch_size}, agg_mode={args.agg_mode}, margin_tau={args.margin_tau}, "
-        f"margin_lambda={args.margin_lambda}, fp16={use_fp16}"
+        f"batch={args.batch_size}, agg_mode={args.agg_mode}, hinge_mode={args.hinge_mode}, "
+        f"margin_mode={args.margin_mode}, margin_m={args.margin_m}, margin_tau={args.margin_tau}, "
+        f"margin_lambda={args.margin_lambda}, anomaly_frac={args.anomaly_frac}, fp16={use_fp16}"
     )
     # print("----------------Calling pipeline_fit from main()---------------")
     pipeline.fit(**fit_kwargs)

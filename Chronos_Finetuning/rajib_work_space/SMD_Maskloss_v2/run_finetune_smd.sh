@@ -3,10 +3,15 @@
 #
 # The loss is a PER-STEP masked margin (hinge) objective. The per-timestep labels
 # (future_labels, 0=normal / 1=anomaly) mask the model's per-step pinball loss:
-#   L = L_good + lambda * max(0, tau - L_bad)
-#   normal steps (label 0)  → L_good : minimised (predict normal well)
-#   anomaly steps (label 1) → L_bad  : pushed UP toward margin tau, then saturates
-# No count threshold is used; AGG_MODE selects how the masked means are pooled
+#   L = L_good + lambda * L_bad_term
+#   normal steps (label 0)  → L_good     : minimised (predict normal well)
+#   anomaly steps (label 1) → L_bad_term : pushed UP toward a margin, then saturates
+#
+# v2 folds in three team suggestions (each reversible to v1 via env vars):
+#   1. HINGE_MODE=per_step   → hinge every anomaly step, not just the pooled mean
+#   2. MARGIN_MODE=relative  → margin = MARGIN_M * per-window normal loss (self-scaling)
+#   3. ANOMALY_FRAC=0.5      → oversample anomaly windows so every batch trains the bad term
+# No count threshold is used; AGG_MODE selects how the masked losses are pooled
 # (batch_global = per-step pooling, per_window = per-window means then averaged).
 #
 # Assumes the prepared data dir contains the COMBINED model inputs:
@@ -39,14 +44,16 @@ WORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                  # .../rajib_work_sp
 # Paths
 # PREPARED_DIR must contain train_model_inputs.pkl (and val_model_inputs.pkl unless
 # NO_VALIDATION=1). The SMD pkls live next to this script, in SMD_run.
-PREPARED_DIR="${PREPARED_DIR:-${SCRIPT_DIR}/prepared_50_50}"                # train (& val) data = SMD_run
-OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-single-stage_SMD_maskLoss_v2}"
+# PREPARED_DIR="${PREPARED_DIR:-${SCRIPT_DIR}/prepared_50_50}"
+                # train (& val) data = SMD_run
+PREPARED_DIR="${PREPARED_DIR:-/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/prepared_data_labeled}"
+OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-single-stage_SMD_maskLossv2_mtsbench}"
 
 # Optional third dataset (full path to a .pkl). When set, it is evaluated and
 # logged every eval step exactly like validation (no weight updates), as eval_test_*.
 # TEST_DATA="${TEST_DATA:-${REPO_ROOT}/rajib_work_space/prepared_data_labeled/test_model_inputs.pkl}" # test data, --significant portion of train data; ignored if set empty
 
-TEST_DATA="${TEST_DATA:-/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_MaskLoss/prepared_50_50/EVAL_TEST.pkl}"
+TEST_DATA="${TEST_DATA:-/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/prepared_data_labeled/test_model_inputs.pkl}"
 # Model
 MODEL_ID="${MODEL_ID:-amazon/chronos-2}"
 DEVICE="${DEVICE:-cuda}"
@@ -60,12 +67,12 @@ PREDICTION_LENGTH="${PREDICTION_LENGTH:-64}"
 #       It must equal data-prep NORMAL_SIGNAL_LENGTH + data-prep CONTEXT_LENGTH
 #       e.g.  CONTEXT_LENGTH (768) = NORMAL_SIGNAL_LENGTH (256) + CONTEXT_LENGTH (512)
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-768}"
-NUM_STEPS="${NUM_STEPS:-4000}"
+NUM_STEPS="${NUM_STEPS:-2000}"
 LR="${LR:-1e-5}"                                    # blank → script default (1e-5 lora / 1e-6 full)
 BATCH_SIZE="${BATCH_SIZE:-160}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"                   # effective batch = BATCH_SIZE * GRAD_ACCUM
-LOGGING_STEPS="${LOGGING_STEPS:-10}"
-EVAL_STEPS="${EVAL_STEPS:-10}"      # validate + log eval_loss every N steps (must divide 100)
+LOGGING_STEPS="${LOGGING_STEPS:-50}"
+EVAL_STEPS="${EVAL_STEPS:-50}"      # validate + log eval_loss every N steps (must divide 100)
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 FP16="${FP16:-1}"                               # 1 = fp16 mixed precision, 0 = disable
@@ -76,11 +83,31 @@ DEBUG="${DEBUG:-0}"                             # set to 1 to truncate train/val
 # ANOMALY_THRESHOLD anomalous timesteps (out of PREDICTION_LENGTH); else normal.
 ANOMALY_THRESHOLD="${ANOMALY_THRESHOLD:-10}"
 
-# Margin (hinge) loss: L_good + MARGIN_LAMBDA * max(0, MARGIN_TAU - L_bad).
-# MARGIN_TAU must sit ABOVE the normal-point loss (~3-4 here) to matter — use ~10-15,
-# NOT 2. The hinge self-saturates once L_bad >= tau, so no ceiling clamp is needed.
+# Margin (hinge) loss: L_good + MARGIN_LAMBDA * L_bad_term.
+#
+# v2 (team suggestions) — bad-term shape is controlled by HINGE_MODE + MARGIN_MODE:
+#
+#   HINGE_MODE  (Suggestion 1: hinge each anomaly step, not the pooled mean)
+#     per_step  -> L_bad_term = mean over anomaly steps of max(0, margin - per_step_i)
+#                  (DEFAULT; pushes EVERY anomalous timestep — matches per-step VUS)
+#     pooled    -> hinge only the mean anomaly loss (v1 behaviour)
+#
+#   MARGIN_MODE (Suggestion 2: relative, not absolute, margin)
+#     relative  -> margin = MARGIN_M * L_good_w.detach() per window (DEFAULT;
+#                  self-scales across quiet/busy SMD machines)
+#     absolute  -> margin = MARGIN_TAU, a fixed constant (v1 behaviour)
+HINGE_MODE="${HINGE_MODE:-per_step}"
+MARGIN_MODE="${MARGIN_MODE:-relative}"
+MARGIN_M="${MARGIN_M:-5}"                     # relative-margin multiplier (MARGIN_MODE=relative)
+# MARGIN_TAU is used only when MARGIN_MODE=absolute. Must sit ABOVE the normal-point
+# loss (~3-4 here) to matter — use ~10-15, NOT 2.
 MARGIN_TAU="${MARGIN_TAU:-13.0}"
 MARGIN_LAMBDA="${MARGIN_LAMBDA:-1.0}"
+
+# Suggestion 3: oversample anomaly windows in the train sampler. Target fraction of
+# anomaly windows drawn into each batch (~4.7% of SMD train windows are anomalous, so
+# uniform sampling starves the bad term). Set to 0 to disable (uniform, v1 behaviour).
+ANOMALY_FRAC="${ANOMALY_FRAC:-0.5}"
 
 # Per-step masked-loss aggregation:
 #   batch_global -> pool all steps in the batch (each step weighted equally; most
@@ -148,8 +175,12 @@ echo "  FP16              = $FP16"
 echo "  NO_VALIDATION     = $NO_VALIDATION"
 echo "  DEBUG             = $DEBUG  (1 = truncate train/val to 50 samples)"
 echo "  ANOMALY_THRESHOLD = $ANOMALY_THRESHOLD  (>= this many anomalous steps -> anomaly window)"
-echo "  MARGIN_TAU        = $MARGIN_TAU"
+echo "  HINGE_MODE        = $HINGE_MODE  (Suggestion 1: per_step | pooled)"
+echo "  MARGIN_MODE       = $MARGIN_MODE  (Suggestion 2: relative | absolute)"
+echo "  MARGIN_M          = $MARGIN_M  (relative-margin multiplier; MARGIN_MODE=relative)"
+echo "  MARGIN_TAU        = $MARGIN_TAU  (absolute margin; MARGIN_MODE=absolute)"
 echo "  MARGIN_LAMBDA     = $MARGIN_LAMBDA"
+echo "  ANOMALY_FRAC      = $ANOMALY_FRAC  (Suggestion 3: anomaly-window oversample fraction)"
 echo "  AGG_MODE          = $AGG_MODE  (per-step masked loss aggregation)"
 if [ "$FINETUNE_MODE" = "lora" ]; then
 echo "------------------------------------------------------"
@@ -196,8 +227,12 @@ FINETUNE_ARGS=(
     --warmup_ratio                "$WARMUP_RATIO"
     --lr_scheduler_type           "$LR_SCHEDULER"
     --anomaly_threshold           "$ANOMALY_THRESHOLD"
+    --hinge_mode                  "$HINGE_MODE"
+    --margin_mode                 "$MARGIN_MODE"
+    --margin_m                    "$MARGIN_M"
     --margin_tau                  "$MARGIN_TAU"
     --margin_lambda               "$MARGIN_LAMBDA"
+    --anomaly_frac                "$ANOMALY_FRAC"
     --agg_mode                    "$AGG_MODE"
 )
 
@@ -233,7 +268,8 @@ fi
 # Clear stale bytecode so edits made on Windows are always picked up in WSL
 find "$WORK_ROOT/chronos" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
-python -u "$WORK_ROOT/SMD_MaskLoss/finetune_anomaly_simple.py" "${FINETUNE_ARGS[@]}"
+# Use the v2 training entrypoint that lives alongside this script (NOT the v1 copy).
+python -u "$SCRIPT_DIR/finetune_anomaly_simple.py" "${FINETUNE_ARGS[@]}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Done
