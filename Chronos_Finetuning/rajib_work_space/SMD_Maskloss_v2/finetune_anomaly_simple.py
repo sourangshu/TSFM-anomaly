@@ -19,16 +19,21 @@ v2 folds in three team suggestions (all off-able via CLI to recover v1 behaviour
   2. margin_mode=relative — margin = margin_m * L_good_w.detach() per window, so the
      bad target self-scales to each SMD machine's own normal error instead of a
      fixed tau that over-pushes quiet series and is pre-satisfied on busy ones.
-  3. --anomaly_frac       — oversample anomaly windows in the train sampler so every
-     batch carries a bad-term gradient (only ~4.7% of SMD train windows are anomalous).
+  3. --sampling_target    — count-weighted train sampler: draw each window with
+     probability proportional to its anomaly-STEP count (thresholdless), so every
+     batch carries a strong, steady bad-term gradient. Anomaly steps are rare (~14%
+     of steps), which starves the bad term under uniform sampling; the sampler lifts
+     them to `sampling_target` (default 0.4) per batch. No data is thrown away and no
+     balanced pkl is needed — the full pkl is kept and balancing happens on the fly.
+     Eval is never balanced, so eval metrics stay honest.
 
 At inference: high prediction error ⟹ high anomaly score.
 
 Usage:
     python finetune_anomaly_simple.py                                  # v2 defaults
-    python finetune_anomaly_simple.py --margin_mode relative --margin_m 2.5
+    python finetune_anomaly_simple.py --margin_mode relative --margin_m 3
     python finetune_anomaly_simple.py --hinge_mode pooled --margin_mode absolute \
-        --margin_tau 13 --anomaly_frac 0                               # v1 behaviour
+        --margin_tau 13 --sampling_target 0                            # ~v1 behaviour
 """
 
 import argparse
@@ -72,26 +77,68 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
     up with `context`/`future_target`/`group_ids` (each input series contributes
     `group_size` rows). The single-stage trainer pops it back off in compute_loss.
 
-    Anomaly oversampling (Suggestion 3)
-    -----------------------------------
-    Only ~4.7% of SMD train windows contain anomalies, so with uniform sampling most
-    optimizer steps never see an anomaly step and the margin (bad) term gets no
-    gradient. The class attribute `anomaly_frac` (set from --anomaly_frac before
-    fit) biases `_generate_train_batches` so that a target fraction of the windows
-    drawn into each micro-batch are anomalous (future_type==1). `anomaly_frac <= 0`
-    restores the original uniform sampling.
+    Count-weighted anomaly sampling (class imbalance)
+    -------------------------------------------------
+    Anomaly steps are rare (~14% of forecast steps on mtsbench, ~4.7% of SMD train
+    windows), so with the stock uniform sampler most optimizer steps see few/no
+    anomaly steps and the margin (bad) term gets a weak, bursty gradient. We fix this
+    at TRAIN TIME (no data thrown away, no balanced pkl): `_generate_train_batches`
+    draws each window with probability proportional to its anomaly-step count,
+
+        weight_i = n_anom_i + eps * H          (H = prediction_length)
+
+    so anomaly-dense windows are visited more often while the `eps * H` floor keeps
+    every window — including pure-normal ones — reachable (L_good still trains). This
+    is thresholdless: a window with 40 anomaly steps counts more than one with 2, and
+    there is no >= T cutoff. `eps` is not set by hand; it is solved once from the
+    class attribute `sampling_target` (the desired anomaly-STEP fraction per batch,
+    default 0.4). Set on the class from main() before pipeline.fit(). Validation uses
+    sequential batching (not this sampler), so eval keeps the natural, unbalanced
+    distribution — eval metrics stay honest.
     """
 
-    # Target fraction of anomaly windows per train batch. 0 => uniform (original).
-    # Set on the class from main() before pipeline.fit() instantiates the dataset.
-    anomaly_frac: float = 0.0
+    # Desired anomaly-STEP fraction per train batch (0.4 default). `eps` is solved
+    # from this. Set on the class from main() before pipeline.fit() builds the dataset.
+    sampling_target: float = 0.4
+
+    @staticmethod
+    def _solve_eps(n_anom: np.ndarray, H: int, target: float) -> float:
+        """Binary-search the eps floor so weight_i = n_anom_i + eps*H yields an
+        expected anomaly-STEP fraction == target under sampling ∝ weight_i.
+
+        Expected fraction = sum(w_i * n_anom_i) / (H * sum(w_i)), which decreases
+        monotonically from ~max (eps→0) toward the uniform baseline mean(n_anom)/H
+        (eps→∞). If target <= uniform baseline it is unreachable by oversampling, so
+        we return +inf (≈ uniform)."""
+        n = n_anom.astype(np.float64)
+        baseline = n.mean() / H
+        if target <= baseline:
+            return float("inf")
+
+        def frac_for(eps: float) -> float:
+            w = n + eps * H
+            return float((w * n).sum() / (H * w.sum()))
+
+        lo, hi = 0.0, 1.0
+        while frac_for(hi) > target:      # grow hi until its fraction drops below target
+            hi *= 2.0
+            if hi > 1e9:
+                return hi
+        for _ in range(60):               # bisection on the monotone frac_for
+            mid = 0.5 * (lo + hi)
+            if frac_for(mid) > target:
+                lo = mid
+            else:
+                hi = mid
+        return 0.5 * (lo + hi)
 
     def __init__(self, inputs, *args, **kwargs):
-        future_types = [int(d.get("future_type", 0)) for d in inputs]
         # Per-timestep labels (length = prediction_length), 0=normal / 1=anomaly.
-        # These drive the per-step masked loss; the window-level future_type is kept
-        # only for backward-compatible logging.
+        # These drive both the per-step masked loss AND the count-weighted sampler.
         future_labels = [np.asarray(d["future_labels"], dtype=np.int64) for d in inputs]
+        # Window-level future_type is derived (presence: any anomaly step) purely for
+        # backward-compatible logging/monitoring; the loss & sampler use future_labels.
+        future_types = [int(fl.sum() >= 1) for fl in future_labels]
         # Strip BOTH our extra keys before the parent's validation: `future_type`
         # (the window-level label) and `future_labels` (the per-timestep array).
         cleaned = [
@@ -101,10 +148,10 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
         super().__init__(cleaned, *args, **kwargs)
         # Parent filters series shorter than min_past + prediction_length. Our fixed
         # 832-step targets are never filtered, so prepared inputs align 1:1 with
-        # future_types. Guard loudly in case lengths change and some get dropped.
-        if len(self.inputs) != len(future_types):
+        # future_labels. Guard loudly in case lengths change and some get dropped.
+        if len(self.inputs) != len(future_labels):
             raise RuntimeError(
-                f"future_type alignment broke: {len(future_types)} inputs given but "
+                f"future_label alignment broke: {len(future_labels)} inputs given but "
                 f"{len(self.inputs)} survived length filtering. Ensure every target is "
                 "at least min_past + prediction_length steps long."
             )
@@ -113,44 +160,88 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
             prepared["future_type"] = ft
             prepared["future_labels"] = fl
 
-        # Index pools for optional anomaly oversampling in _generate_train_batches.
-        ftypes = np.asarray(
-            [self.inputs[i]["future_type"] for i in range(len(self.inputs))]
+        # ── Count-weighted sampling distribution over ALL windows ────────────────
+        self._n_anom = np.asarray(
+            [int(self.inputs[i]["future_labels"].sum()) for i in range(len(self.inputs))],
+            dtype=np.int64,
         )
-        self._anom_idx = np.nonzero(ftypes == 1)[0]
-        self._norm_idx = np.nonzero(ftypes == 0)[0]
+        self._H = int(self.inputs[0]["future_labels"].shape[0]) if len(self.inputs) else 0
+        n_anom_win = int((self._n_anom >= 1).sum())
+        baseline = self._n_anom.mean() / self._H if self._H else 0.0
+        target = float(type(self).sampling_target)
+
+        if self._n_anom.sum() == 0 or target <= 0.0:
+            # No anomalies to weight toward → plain uniform sampling.
+            self._cum, self._eps, self._exp_frac = None, float("inf"), baseline
+        else:
+            self._eps = self._solve_eps(self._n_anom, self._H, target)
+            w = self._n_anom.astype(np.float64) + self._eps * self._H
+            self._exp_frac = float((w * self._n_anom).sum() / (self._H * w.sum()))
+            self._cum = np.cumsum(w / w.sum())         # for O(log N) searchsorted draws
+            self._cum[-1] = 1.0                         # guard against fp drift
+
         logger.info(
-            f"AnomalyChronos2Dataset: {len(self._anom_idx)} anomaly / "
-            f"{len(self._norm_idx)} normal windows "
-            f"({100.0 * len(self._anom_idx) / max(len(self.inputs), 1):.1f}% anomalous); "
-            f"anomaly_frac={type(self).anomaly_frac}"
+            f"AnomalyChronos2Dataset: {len(self.inputs)} windows, "
+            f"{n_anom_win} anomaly-bearing ({100.0 * n_anom_win / max(len(self.inputs), 1):.1f}%), "
+            f"per-step anomaly baseline={100.0 * baseline:.1f}%. "
+            f"Count-weighted sampler: target={100.0 * target:.0f}% anomaly steps/batch → "
+            f"eps={self._eps:.4g}, expected={100.0 * self._exp_frac:.1f}%"
+            + ("  [UNIFORM fallback: target<=baseline or no anomalies]"
+               if self._cum is None else "")
         )
+        # Warn when the target is unreachable: if anomalies are scattered (few steps per
+        # window) the sampler saturates below target — even sampling only anomaly windows
+        # can't exceed their own anomaly-step density. Lower sampling_target accordingly.
+        if self._cum is not None and self._exp_frac < 0.95 * target:
+            logger.warning(
+                f"[sampler] target {100.0 * target:.0f}% is UNREACHABLE for this data — "
+                f"max achievable is ~{100.0 * self._exp_frac:.1f}% because anomaly windows "
+                f"average only {self._n_anom[self._n_anom >= 1].mean():.1f}/{self._H} anomaly "
+                f"steps. Sampling is maxed out; consider lowering --sampling_target."
+            )
+        # Running realized-balance monitor (logged periodically from the sampler).
+        self._seen_batches = 0
+        self._seen_anom_steps = 0
+        self._seen_total_steps = 0
 
     def _generate_train_batches(self):
-        """Same as the parent, but optionally oversamples anomaly windows.
+        """Count-weighted training batches (class-imbalance fix).
 
-        When `anomaly_frac > 0`, each window drawn into the micro-batch is chosen from
-        the anomaly pool with probability `anomaly_frac` and from the normal pool
-        otherwise, so (in expectation) that fraction of every batch is anomalous and
-        the margin term always receives gradient. Falls back to the original uniform
-        `np.random.randint` sampling when disabled or when either pool is empty.
+        Each window is drawn with probability proportional to `n_anom_i + eps*H`
+        (precomputed cumulative dist `self._cum`), so anomaly-dense windows appear
+        more often while pure-normal windows stay reachable. This is a WEIGHTED
+        RANDOM draw — not an argmax — so every batch is still a fresh random sample;
+        only the class mix is tilted toward `sampling_target`. Falls back to uniform
+        when `self._cum is None` (no anomalies, or target <= natural baseline).
         """
-        frac = float(type(self).anomaly_frac)
-        use_weighted = (
-            frac > 0.0 and len(self._anom_idx) > 0 and len(self._norm_idx) > 0
-        )
         while True:
             current_batch_size = 0
             input_indices = []
 
             while current_batch_size < self.batch_size:
-                if use_weighted:
-                    pool = self._anom_idx if np.random.random() < frac else self._norm_idx
-                    input_idx = int(np.random.choice(pool))
-                else:
+                if self._cum is None:
                     input_idx = np.random.randint(len(self.inputs))
+                else:
+                    # O(log N) inverse-CDF sample: random u in [0,1) → window index.
+                    input_idx = int(np.searchsorted(self._cum, np.random.random(), side="right"))
+                    if input_idx >= len(self.inputs):        # fp edge guard
+                        input_idx = len(self.inputs) - 1
                 input_indices.append(input_idx)
                 current_batch_size += self.inputs[input_idx]["context"].shape[0]
+
+            # Realized-balance monitor: track the anomaly-STEP fraction the sampler is
+            # actually delivering (window-level, matching the eps-solve math) and log
+            # it periodically so the achieved balance is visible in the run log.
+            self._seen_batches += 1
+            self._seen_anom_steps += int(self._n_anom[input_indices].sum())
+            self._seen_total_steps += len(input_indices) * self._H
+            if self._seen_batches % 500 == 0 and self._seen_total_steps > 0:
+                logger.info(
+                    f"[sampler] realized anomaly-step fraction over "
+                    f"{self._seen_batches} batches: "
+                    f"{100.0 * self._seen_anom_steps / self._seen_total_steps:.1f}% "
+                    f"(target {100.0 * float(type(self).sampling_target):.0f}%)"
+                )
 
             yield self._build_batch(input_indices)
 
@@ -454,9 +545,6 @@ def parse_args():
     p.add_argument("--data_dir", default="./prepared_data_labeled",
                    help="Output dir from inst_data_prepare_labeled.py "
                         "(must contain train_model_inputs.pkl / val_model_inputs.pkl)")
-    p.add_argument("--anomaly_threshold", type=int, default=10,
-                   help="A future window is labeled anomalous (future_type=1) iff it "
-                        "contains at least this many anomalous timesteps; else normal.")
     p.add_argument("--no_validation", action="store_true")
     p.add_argument("--test_data", default=None,
                    help="Optional path to a third dataset pkl (e.g. test_model_inputs.pkl). "
@@ -504,9 +592,11 @@ def parse_args():
                    help="Suggestion 2. 'relative' uses margin = margin_m * "
                         "L_good_w.detach() per window (self-scales across quiet/busy "
                         "SMD machines); 'absolute' uses the fixed margin_tau.")
-    p.add_argument("--margin_m", type=float, default=5,
+    p.add_argument("--margin_m", type=float, default=3,
                    help="Relative-margin multiplier (margin_mode=relative). Anomaly "
-                        "error must reach margin_m x the window's own normal error. ~2-3.")
+                        "error must reach margin_m x the window's own normal error. "
+                        "~2-4 with count-weighted balancing on (the sampler now "
+                        "supplies the anomaly gradient, so M need not be cranked high).")
     p.add_argument("--margin_tau", type=float, default=12.0,
                    help="Absolute margin (margin_mode=absolute). Must sit ABOVE the "
                         "normal-point loss (~3-4 here) to matter — use ~10-15, NOT 2.")
@@ -518,11 +608,15 @@ def parse_args():
                         "all steps (each step weighted equally, most stable across "
                         "datasets); 'per_window' averages per-window means (each window "
                         "weighted equally).")
-    p.add_argument("--anomaly_frac", type=float, default=0.5,
-                   help="Suggestion 3. Target fraction of anomaly windows drawn into "
-                        "each train batch (weighted sampling). ~4.7%% of SMD train "
-                        "windows are anomalous, so 0 (uniform) starves the bad term of "
-                        "gradient. Set <=0 to disable oversampling.")
+    p.add_argument("--sampling_target", type=float, default=0.4,
+                   help="Class-imbalance fix. Desired anomaly-STEP fraction per train "
+                        "batch. The train sampler draws windows with probability "
+                        "proportional to their anomaly-step count (thresholdless); the "
+                        "eps floor is auto-solved to hit this target. Anomaly steps are "
+                        "~14%% of steps naturally, so 0.4 gives a strong, steady bad-term "
+                        "gradient while L_good still trains. Set <=0 (or <= the natural "
+                        "baseline) to fall back to uniform sampling. Eval is never "
+                        "balanced.")
 
     # Output
     p.add_argument("--output_dir", default="./chronos2-single-stage")
@@ -662,17 +756,18 @@ def main():
 
     # ── Train ─────────────────────────────────────────────────────────────────
     # pipeline.fit builds its dataset internally; swap in our subclass so that
-    # per-sample future_type survives into the trainer's compute_loss.
+    # per-sample future_labels survive into the trainer's compute_loss.
     chronos2_pipeline.Chronos2Dataset = AnomalyChronos2Dataset
-    # Suggestion 3: bias the train sampler toward anomaly windows. The dataset is
-    # instantiated inside pipeline.fit, so pass this via the class attribute.
-    AnomalyChronos2Dataset.anomaly_frac = args.anomaly_frac
+    # Class-imbalance fix: the count-weighted train sampler solves its eps floor from
+    # this target. The dataset is instantiated inside pipeline.fit, so pass it via the
+    # class attribute.
+    AnomalyChronos2Dataset.sampling_target = args.sampling_target
 
     logger.info(
         f"Single-stage per-step masked training: lr={args.lr}, steps={args.num_steps}, "
         f"batch={args.batch_size}, agg_mode={args.agg_mode}, hinge_mode={args.hinge_mode}, "
         f"margin_mode={args.margin_mode}, margin_m={args.margin_m}, margin_tau={args.margin_tau}, "
-        f"margin_lambda={args.margin_lambda}, anomaly_frac={args.anomaly_frac}, fp16={use_fp16}"
+        f"margin_lambda={args.margin_lambda}, sampling_target={args.sampling_target}, fp16={use_fp16}"
     )
     # print("----------------Calling pipeline_fit from main()---------------")
     pipeline.fit(**fit_kwargs)

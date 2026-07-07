@@ -10,7 +10,7 @@
 # v2 folds in three team suggestions (each reversible to v1 via env vars):
 #   1. HINGE_MODE=per_step   → hinge every anomaly step, not just the pooled mean
 #   2. MARGIN_MODE=relative  → margin = MARGIN_M * per-window normal loss (self-scaling)
-#   3. ANOMALY_FRAC=0.5      → oversample anomaly windows so every batch trains the bad term
+#   3. SAMPLING_TARGET=0.4   → count-weighted sampler lifts anomaly steps to 40%/batch
 # No count threshold is used; AGG_MODE selects how the masked losses are pooled
 # (batch_global = per-step pooling, per_window = per-window means then averaged).
 #
@@ -46,14 +46,14 @@ WORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                  # .../rajib_work_sp
 # NO_VALIDATION=1). The SMD pkls live next to this script, in SMD_run.
 # PREPARED_DIR="${PREPARED_DIR:-${SCRIPT_DIR}/prepared_50_50}"
                 # train (& val) data = SMD_run
-PREPARED_DIR="${PREPARED_DIR:-/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/prepared_data_labeled}"
-OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-single-stage_SMD_maskLossv2_mtsbench}"
+PREPARED_DIR="${PREPARED_DIR:-/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_Maskloss_v2/prepared_50_50}"
+OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-single-stage_SMD_maskLossv2_v1}"
 
 # Optional third dataset (full path to a .pkl). When set, it is evaluated and
 # logged every eval step exactly like validation (no weight updates), as eval_test_*.
 # TEST_DATA="${TEST_DATA:-${REPO_ROOT}/rajib_work_space/prepared_data_labeled/test_model_inputs.pkl}" # test data, --significant portion of train data; ignored if set empty
 
-TEST_DATA="${TEST_DATA:-/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/prepared_data_labeled/test_model_inputs.pkl}"
+TEST_DATA="${TEST_DATA:-/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_Maskloss_v2/prepared_50_50/EVAL_TEST.pkl}"
 # Model
 MODEL_ID="${MODEL_ID:-amazon/chronos-2}"
 DEVICE="${DEVICE:-cuda}"
@@ -79,10 +79,6 @@ FP16="${FP16:-1}"                               # 1 = fp16 mixed precision, 0 = 
 NO_VALIDATION="${NO_VALIDATION:-0}"             # 1 = disable validation (SMD_run has no val pkl)
 DEBUG="${DEBUG:-0}"                             # set to 1 to truncate train/val to 50 samples (smoke test)
 
-# A future window is labeled anomalous (future_type=1) iff it contains at least
-# ANOMALY_THRESHOLD anomalous timesteps (out of PREDICTION_LENGTH); else normal.
-ANOMALY_THRESHOLD="${ANOMALY_THRESHOLD:-10}"
-
 # Margin (hinge) loss: L_good + MARGIN_LAMBDA * L_bad_term.
 #
 # v2 (team suggestions) — bad-term shape is controlled by HINGE_MODE + MARGIN_MODE:
@@ -98,26 +94,31 @@ ANOMALY_THRESHOLD="${ANOMALY_THRESHOLD:-10}"
 #     absolute  -> margin = MARGIN_TAU, a fixed constant (v1 behaviour)
 HINGE_MODE="${HINGE_MODE:-per_step}"
 MARGIN_MODE="${MARGIN_MODE:-relative}"
-MARGIN_M="${MARGIN_M:-5}"                     # relative-margin multiplier (MARGIN_MODE=relative)
+# Relative-margin multiplier (MARGIN_MODE=relative). Default 3 for SMD: with the
+# count-weighted sampler now supplying a strong anomaly gradient, M need not be cranked
+# high. For mtsbench, override MARGIN_M=5 (isolates balancing vs the prior M=5 run).
+MARGIN_M="${MARGIN_M:-3}"
 # MARGIN_TAU is used only when MARGIN_MODE=absolute. Must sit ABOVE the normal-point
 # loss (~3-4 here) to matter — use ~10-15, NOT 2.
-MARGIN_TAU="${MARGIN_TAU:-13.0}"
+MARGIN_TAU="${MARGIN_TAU:-6}"
 MARGIN_LAMBDA="${MARGIN_LAMBDA:-1.0}"
 
-# Suggestion 3: oversample anomaly windows in the train sampler. Target fraction of
-# anomaly windows drawn into each batch (~4.7% of SMD train windows are anomalous, so
-# uniform sampling starves the bad term). Set to 0 to disable (uniform, v1 behaviour).
-ANOMALY_FRAC="${ANOMALY_FRAC:-0.5}"
+# Class-imbalance fix: count-weighted train sampler. Draws windows with probability
+# proportional to their anomaly-STEP count (thresholdless) so each batch carries a
+# strong, steady bad-term gradient. SAMPLING_TARGET = desired anomaly-step fraction per
+# batch; the eps floor is auto-solved to hit it. All windows are kept (no balanced pkl,
+# no data dropped); eval is never balanced. Set <=0 (or <= natural baseline) for uniform.
+SAMPLING_TARGET="${SAMPLING_TARGET:-0.4}"
 
 # Per-step masked-loss aggregation:
 #   batch_global -> pool all steps in the batch (each step weighted equally; most
 #                   stable across datasets with different anomaly densities)
 #   per_window   -> masked means within each window, then average over windows
 #                   (each window weighted equally regardless of step count)
-AGG_MODE="${AGG_MODE:-batch_global}"
+AGG_MODE="${AGG_MODE:-per_window}"
 
 # LoRA hyperparameters (ignored when FINETUNE_MODE=full)
-LORA_R="${LORA_R:-16}"
+LORA_R="${LORA_R:-32}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.01}"
 
@@ -174,13 +175,12 @@ echo "  LR_SCHEDULER      = $LR_SCHEDULER"
 echo "  FP16              = $FP16"
 echo "  NO_VALIDATION     = $NO_VALIDATION"
 echo "  DEBUG             = $DEBUG  (1 = truncate train/val to 50 samples)"
-echo "  ANOMALY_THRESHOLD = $ANOMALY_THRESHOLD  (>= this many anomalous steps -> anomaly window)"
 echo "  HINGE_MODE        = $HINGE_MODE  (Suggestion 1: per_step | pooled)"
 echo "  MARGIN_MODE       = $MARGIN_MODE  (Suggestion 2: relative | absolute)"
 echo "  MARGIN_M          = $MARGIN_M  (relative-margin multiplier; MARGIN_MODE=relative)"
 echo "  MARGIN_TAU        = $MARGIN_TAU  (absolute margin; MARGIN_MODE=absolute)"
 echo "  MARGIN_LAMBDA     = $MARGIN_LAMBDA"
-echo "  ANOMALY_FRAC      = $ANOMALY_FRAC  (Suggestion 3: anomaly-window oversample fraction)"
+echo "  SAMPLING_TARGET   = $SAMPLING_TARGET  (count-weighted sampler: anomaly-step fraction/batch)"
 echo "  AGG_MODE          = $AGG_MODE  (per-step masked loss aggregation)"
 if [ "$FINETUNE_MODE" = "lora" ]; then
 echo "------------------------------------------------------"
@@ -226,13 +226,12 @@ FINETUNE_ARGS=(
     --eval_steps                  "$EVAL_STEPS"
     --warmup_ratio                "$WARMUP_RATIO"
     --lr_scheduler_type           "$LR_SCHEDULER"
-    --anomaly_threshold           "$ANOMALY_THRESHOLD"
     --hinge_mode                  "$HINGE_MODE"
     --margin_mode                 "$MARGIN_MODE"
     --margin_m                    "$MARGIN_M"
     --margin_tau                  "$MARGIN_TAU"
     --margin_lambda               "$MARGIN_LAMBDA"
-    --anomaly_frac                "$ANOMALY_FRAC"
+    --sampling_target             "$SAMPLING_TARGET"
     --agg_mode                    "$AGG_MODE"
 )
 

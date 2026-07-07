@@ -20,15 +20,20 @@ WORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                  # .../rajib_work_sp
 # ─────────────────────────────────────────────────────────────────────────────
 #  Configuration — edit here or override via environment
 # ─────────────────────────────────────────────────────────────────────────────
+# SMD held-out test set built by run_prepare_smd.sh (this folder's prepared_50_50).
 TEST_PKL="${TEST_PKL:-${SCRIPT_DIR}/prepared_50_50/test_model_inputs.pkl}"
 META_PKL="${META_PKL:-${SCRIPT_DIR}/prepared_50_50/test_series_meta.pkl}"
+# To evaluate a different dataset (e.g. a TOTAL_RUN per-dataset test set), override:
+#   TEST_PKL=.../GECCO/test_model_inputs.pkl META_PKL=.../GECCO/test_series_meta.pkl ./run_forward_smd.sh
+
 OUT_CSV="${OUT_CSV:-${SCRIPT_DIR}/results/50_50_val_results_FT.csv}"
 
 MODEL_ID="${MODEL_ID:-amazon/chronos-2}"
 # CHECKPOINT empty -> zero-shot (MODEL_ID). Set to a path -> evaluate fine-tuned model.
 
 # CHECKPOINT="${CHECKPOINT:-}" # Zero-shot
-CHECKPOINT="${CHECKPOINT:-/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_MaskLoss/chronos2-single-stage_SMD_maskLoss_v1/finetuned-ckpt}" # The fine-tuned model
+# Fine-tuned SMD model — matches OUTPUT_DIR in run_finetune_smd.sh (the SMD run writes here).
+CHECKPOINT="${CHECKPOINT:-${SCRIPT_DIR}/chronos2-single-stage_SMD_maskLossv2_v1/finetuned-ckpt}"
 
 DEVICE="${DEVICE:-cuda}"
 

@@ -8,7 +8,7 @@ __pycache__/
 *.txt
 *.csv
 *.npy
-
+!**/requirements.txt
 # Log files and folders
 *.log
 **/log/

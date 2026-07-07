@@ -50,8 +50,8 @@ plumbed through **`run_finetune_smd.sh`**. New defaults **are** the recommended 
 | # | Suggestion | Flag (env → CLI) | v2 default | v1 value |
 |---|------------|------------------|------------|----------|
 | 1 | Hinge **each** anomaly step, not the pooled mean | `HINGE_MODE` → `--hinge_mode` | `per_step` | `pooled` |
-| 2 | **Relative** margin (× the window's own normal error), not absolute τ | `MARGIN_MODE` → `--margin_mode`, `MARGIN_M` → `--margin_m` | `relative`, `2.5` | `absolute`, τ=13 |
-| 3 | **Oversample** anomaly windows so every batch trains the bad term | `ANOMALY_FRAC` → `--anomaly_frac` | `0.5` | `0` (uniform) |
+| 2 | **Relative** margin (× the window's own normal error), not absolute τ | `MARGIN_MODE` → `--margin_mode`, `MARGIN_M` → `--margin_m` | `relative`, `3` | `absolute`, τ=13 |
+| 3 | **Count-weighted sampler** — fix class imbalance at train time (thresholdless) | `SAMPLING_TARGET` → `--sampling_target` | `0.4` | — (uniform) |
 
 ### 1. Hinge each anomaly step (not the pooled mean)
 
@@ -100,43 +100,75 @@ else:
     margin_eff = per_step.new_full((), float(self.margin_tau))      # scalar
 ```
 
-### 3. Oversample anomaly windows
+**Choosing `MARGIN_M`.** Default is **`3`** (SMD). With the count-weighted sampler (below)
+now supplying a strong, steady anomaly gradient, `M` no longer needs to be cranked high to
+compensate for sparse anomalies — `~2–4` is the useful range. For **mtsbench**, override
+`MARGIN_M=5` to compare apples-to-apples against the earlier `M=5` (unbalanced) run. Tune by
+watching `anomaly_active_frac` (want ~0.2–0.4, not collapsing to 0), the anomaly-step loss
+(should climb), and the normal-step loss (should keep falling — if it stalls, `M` is too
+high and is hurting `L_good`).
 
-**Problem:** only ~4.7% of SMD train windows contain anomalies, and a micro-batch is
-only ~4 windows (160 rows ÷ 38 channels), so most optimizer steps never see an anomaly
-step → the bad term rarely gets gradient.
+### 3. Count-weighted sampler (fix class imbalance at train time)
 
-**Fix:** a weighted train sampler that draws a target fraction of anomaly windows into
-every batch. Implemented by overriding the dataset's batch generator (no pkl
-duplication, no changes to the shared `chronos` package).
+**Problem:** anomaly steps are **rare** — ~3.4% of SMD forecast steps (only ~6.9% of SMD
+train windows are anomaly-bearing), ~14% on mtsbench. Under the stock **uniform** sampler
+most batches carry few/no anomaly steps, so the bad term gets a **weak, bursty** gradient.
+The optimizer then takes the easy path — it drives *normal* loss down and leaves *anomaly*
+loss flat (the exact "normal↓, anomaly flat" symptom seen in earlier plots).
 
-```python
-# finetune_anomaly_simple.py — AnomalyChronos2Dataset._generate_train_batches
-frac = float(type(self).anomaly_frac)
-use_weighted = frac > 0.0 and len(self._anom_idx) > 0 and len(self._norm_idx) > 0
-while True:
-    current_batch_size, input_indices = 0, []
-    while current_batch_size < self.batch_size:
-        if use_weighted:
-            pool = self._anom_idx if np.random.random() < frac else self._norm_idx
-            input_idx = int(np.random.choice(pool))
-        else:                                    # frac<=0 → original uniform sampler
-            input_idx = np.random.randint(len(self.inputs))
-        input_indices.append(input_idx)
-        current_batch_size += self.inputs[input_idx]["context"].shape[0]
-    yield self._build_batch(input_indices)
+**Fix — sample windows by how much anomaly signal they carry.** The loss is per-**step**
+but the sampler picks whole **windows**, so we tilt *which windows* get drawn: each window
+is chosen with probability proportional to its anomaly-**step** count,
+
+```
+weight_i = n_anom_i + eps · H          (H = prediction_length = 64)
 ```
 
-`anomaly_frac` is set on the class from `main()` before `pipeline.fit()` builds the
-dataset. Validation is untouched (it uses sequential, not weighted, batching).
+- **Thresholdless.** A window with 40 anomaly steps counts more than one with 2; there is
+  **no `≥ T` cutoff** (the old window-classification threshold is gone).
+- **`eps · H` floor** keeps *every* window — including pure-normal ones — reachable, so
+  `L_good` still trains.
+- **`eps` is auto-solved**, not hand-set. You give a **target anomaly-step fraction per
+  batch** (`SAMPLING_TARGET`, default `0.4`) and the code binary-searches `eps` to hit it.
+- **No balanced pkl, no data dropped.** The full pkl is kept; balancing happens on the fly.
+- **Eval is never balanced** — validation/test use sequential batching, so eval metrics
+  stay honest (real-world class ratio).
 
-### Bonus: hinge-activity monitor
+```python
+# finetune_anomaly_simple.py — AnomalyChronos2Dataset
+# __init__: solve eps from target, precompute the sampling distribution once
+self._eps = self._solve_eps(self._n_anom, self._H, target)     # target = sampling_target
+w = self._n_anom.astype(np.float64) + self._eps * self._H
+self._cum = np.cumsum(w / w.sum())                             # cumulative dist over ALL windows
 
-A new metric **`anomaly_active_frac`** (logged to `trainer_state.json` and printed at
-each eval) reports the fraction of anomaly steps still **below** their margin, i.e. how
-much of the bad term still carries gradient. Near 0 ⟹ the margin is already satisfied
-everywhere (the "hinge inactive from step 0" symptom). Purely additive — existing
-`plot_mse.ipynb` parsing is unaffected.
+# _generate_train_batches: weighted RANDOM draw (not argmax) via inverse-CDF
+input_idx = int(np.searchsorted(self._cum, np.random.random(), side="right"))
+```
+
+**This is weighted *random* sampling, not "pick the highest".** `searchsorted` on the
+cumulative array is an inverse-CDF draw: a random `u ∈ [0,1)` maps to a window, with
+high-weight windows *more likely* but never guaranteed. Every batch is still a fresh random
+sample — only the class mix is tilted. Randomness and window diversity are preserved.
+
+`sampling_target` is set on the class from `main()` before `pipeline.fit()` builds the
+dataset. Verified on real data: mtsbench & SMD both hit **40.0%** realized anomaly-step
+fraction for `target=0.4`.
+
+**Unreachable targets self-report.** If a dataset's anomalies are *scattered* (few steps
+per window), the target may be mathematically impossible — sampling can't create anomaly
+steps that aren't there. The startup log prints `expected=` vs `target=`, and a
+`WARNING` fires when the max achievable falls short, telling you to lower `SAMPLING_TARGET`.
+(SMD is fine: its anomaly windows average ~31/64 anomaly steps, so 0.4 is reachable.)
+
+### Bonus monitors
+
+- **`anomaly_active_frac`** (in `trainer_state.json`, printed each eval): fraction of anomaly
+  steps still **below** their margin, i.e. how much of the bad term still carries gradient.
+  Near 0 ⟹ the margin is already satisfied everywhere. Watch it stay ~0.2–0.4 (not collapse
+  to 0) as you tune `MARGIN_M`.
+- **realized anomaly-step fraction** — the sampler logs the *actual* anomaly-step % it is
+  delivering every 500 batches (`[sampler] realized anomaly-step fraction ...`), so you can
+  confirm balancing is live and matches `SAMPLING_TARGET`.
 
 ---
 
@@ -149,10 +181,10 @@ Override any of these as environment variables, e.g.
 |---------|---------|---------|
 | `HINGE_MODE` | `per_step` | `per_step` (Suggestion 1) or `pooled` (v1) |
 | `MARGIN_MODE` | `relative` | `relative` (Suggestion 2) or `absolute` (v1) |
-| `MARGIN_M` | `2.5` | relative-margin multiplier (used when `MARGIN_MODE=relative`) |
+| `MARGIN_M` | `3` | relative-margin multiplier (used when `MARGIN_MODE=relative`); use `5` for mtsbench |
 | `MARGIN_TAU` | `13.0` | absolute margin (used **only** when `MARGIN_MODE=absolute`) |
 | `MARGIN_LAMBDA` | `1.0` | weight λ on the bad term |
-| `ANOMALY_FRAC` | `0.5` | target anomaly-window fraction per batch (Suggestion 3); `0` = uniform |
+| `SAMPLING_TARGET` | `0.4` | count-weighted sampler: desired anomaly-**step** fraction per batch (Suggestion 3); `eps` auto-solved. `≤0` or `≤ natural baseline` → uniform |
 | `AGG_MODE` | `batch_global` | `batch_global` (each step equal) or `per_window` (each window equal) |
 | `FINETUNE_MODE` | `lora` | `lora` or `full` |
 | `NUM_STEPS` | `4000` | training steps |
@@ -162,15 +194,28 @@ Override any of these as environment variables, e.g.
 | `NORMAL_SIGNAL_LENGTH` | `256` | length of the normal-signal prefix (multiple of `INPUT_PATCH_SIZE`) |
 | `CONTEXT_LENGTH` | `768` | = `NORMAL_SIGNAL_LENGTH` + actual context (256 + 512) |
 
-### Reproduce exact v1 behaviour
+### Run on mtsbench instead of SMD
 
 ```bash
-HINGE_MODE=pooled MARGIN_MODE=absolute MARGIN_TAU=13 ANOMALY_FRAC=0 \
+PREPARED_DIR=/path/to/prepared_data_labeled \
+TEST_DATA=/path/to/prepared_data_labeled/test_model_inputs.pkl \
+MARGIN_M=5 \
     bash run_finetune_smd.sh
 ```
 
-This combination reproduces the old `L_good + λ·max(0, τ − mean_anomaly_loss)` loss
-bit-for-bit (verified numerically).
+`MARGIN_M=5` keeps the relative margin comparable to the earlier (unbalanced) mtsbench
+run so you can isolate the effect of the new count-weighted balancing.
+
+### Reproduce (close to) v1 behaviour
+
+```bash
+HINGE_MODE=pooled MARGIN_MODE=absolute MARGIN_TAU=13 SAMPLING_TARGET=0 \
+    bash run_finetune_smd.sh
+```
+
+`SAMPLING_TARGET=0` (≤ natural baseline) restores **uniform** sampling; combined with
+`pooled` + `absolute` this recovers the old `L_good + λ·max(0, τ − mean_anomaly_loss)`
+loss with uniform batches (the pre-balancing behaviour).
 
 ---
 
@@ -178,22 +223,26 @@ bit-for-bit (verified numerically).
 
 - **`AnomalyChronos2Dataset`** carries the per-timestep labels (`future_labels`,
   0=normal / 1=anomaly) through to the trainer, replicated per channel-row so they line
-  up with `future_target`. It also (a) overrides `_generate_train_batches` for anomaly
-  oversampling and (b) builds `_anom_idx` / `_norm_idx` index pools.
+  up with `future_target`. It also (a) precomputes per-window anomaly counts + the
+  count-weighted sampling distribution and (b) overrides `_generate_train_batches` to
+  draw windows from it (weighted-random, thresholdless). `future_type` is still derived
+  (presence: any anomaly step) for backward-compatible logging only.
 - **`Chronos2SingleStageTrainer.compute_loss`** does a **single** forward pass, splits
   the model's `per_step_loss` (shape `(rows, horizon)`, summed over quantiles) by the
   step labels, and forms `L_good` + λ·`L_bad_term` per the `hinge_mode` / `margin_mode`
   / `agg_mode` knobs above.
 - `pipeline.fit` builds its dataset internally, so `main()` swaps in the subclass and
-  sets the oversampling fraction just before fit:
+  sets the sampling target just before fit:
 
   ```python
   chronos2_pipeline.Chronos2Dataset = AnomalyChronos2Dataset
-  AnomalyChronos2Dataset.anomaly_frac = args.anomaly_frac   # Suggestion 3
+  AnomalyChronos2Dataset.sampling_target = args.sampling_target   # count-weighted sampler
   ```
 
 No files outside `SMD_Maskloss_v2/` are modified — the shared `chronos` package and the
-data-prep pipeline are untouched.
+data-prep pipeline are untouched. **The data prep (`prepare_smd_split.py`) keeps *all*
+windows** (every sliding window, per-step `future_labels`); no balancing is done at prep
+time — the class imbalance is handled entirely by the runtime sampler.
 
 ---
 
@@ -211,8 +260,26 @@ data-prep pipeline are untouched.
 
 ## Verification done
 
-- Python + bash syntax check pass.
-- Numerical test over all 8 `hinge_mode × margin_mode × agg_mode` combinations: every
-  combination is finite and produces gradients; the v1 combo reproduces the old loss
-  exactly; per-step gradients confirm Suggestion 1 isolates and pushes the
-  well-predicted anomaly steps that the pooled hinge would have starved.
+- Python + bash syntax checks pass (`py_compile`, `bash -n`).
+- **Loss** — numerical test over all 8 `hinge_mode × margin_mode × agg_mode`
+  combinations: every combination is finite and produces gradients; the v1 combo
+  reproduces the old loss exactly; per-step gradients confirm Suggestion 1 isolates and
+  pushes the well-predicted anomaly steps that the pooled hinge would have starved.
+- **Count-weighted sampler** — `_solve_eps` + Monte-Carlo draws tested on the **real**
+  pkls: `SAMPLING_TARGET=0.4` yields a realized anomaly-step fraction of **40.0%**
+  (mtsbench) and **40.2%** (SMD); all anomaly-bearing windows are reachable; edge cases
+  (no anomalies / target ≤ baseline) fall back to uniform. Confirmed SMD's `0.4` target
+  is reachable (anomaly windows average ~31/64 anomaly steps).
+
+## Changelog vs the previous v2
+
+- **Suggestion 3 replaced**: the presence-based window oversampler (`ANOMALY_FRAC`,
+  which silently fell back to uniform because window labels were never derived) is gone.
+  It's now a **thresholdless count-weighted sampler** (`SAMPLING_TARGET`, `eps`
+  auto-solved) that actually engages.
+- **Removed** the dead `--anomaly_threshold` / `ANOMALY_THRESHOLD` knob (count-weighting
+  needs no threshold).
+- **`MARGIN_M` default 5 → 3** (balancing now supplies the anomaly gradient).
+- Startup log now reports **real** anomaly stats (previously mislogged "0 anomaly
+  windows"); added the realized-fraction sampler monitor and an unreachable-target
+  warning.
