@@ -20,22 +20,22 @@ WORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                  # .../rajib_work_sp
 # ─────────────────────────────────────────────────────────────────────────────
 #  Configuration — edit here or override via environment
 # ─────────────────────────────────────────────────────────────────────────────
-TEST_PKL="${TEST_PKL:-${SCRIPT_DIR}/prepared_50_50/test_model_inputs.pkl}"
-META_PKL="${META_PKL:-${SCRIPT_DIR}/prepared_50_50/test_series_meta.pkl}"
-OUT_CSV="${OUT_CSV:-${SCRIPT_DIR}/results/50_50_eval_results_FT.csv}"
+TEST_PKL="${TEST_PKL:-${SCRIPT_DIR}/prepared_ppt/test_model_inputs.pkl}"
+META_PKL="${META_PKL:-${SCRIPT_DIR}/prepared_ppt/test_series_meta.pkl}"
+OUT_CSV="${OUT_CSV:-${SCRIPT_DIR}/results/ppt_eval_results_FT.csv}"
 
 MODEL_ID="${MODEL_ID:-amazon/chronos-2}"
 # CHECKPOINT empty -> zero-shot (MODEL_ID). Set to a path -> evaluate fine-tuned model.
 
-# CHECKPOINT="${CHECKPOINT:-}" # Zero-shot
-CHECKPOINT="${CHECKPOINT:-/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_run/chronos2-single-stage_SMD_v2_50_50/finetuned-ckpt}" # The fine-tuned model
+CHECKPOINT="${CHECKPOINT:-}" # Zero-shot
+# CHECKPOINT="${CHECKPOINT:-/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_run/chronos2-single-stage_SMD_v2_50_50/finetuned-ckpt}" # The fine-tuned model
 
 DEVICE="${DEVICE:-cuda}"
 
 # Sequence layout — must match the data-prep values used to build the pkl
 NORMAL_SIGNAL_LENGTH="${NORMAL_SIGNAL_LENGTH:-256}"
-CONTEXT_LENGTH="${CONTEXT_LENGTH:-512}"
-PREDICTION_LENGTH="${PREDICTION_LENGTH:-64}"
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-256}"
+PREDICTION_LENGTH="${PREDICTION_LENGTH:-100}"
 # Must match INPUT_PATCH_SIZE in run_finetune_smd.sh. Used to restore the SEP patch
 # index (= NORMAL_SIGNAL_LENGTH / INPUT_PATCH_SIZE) on the fine-tuned checkpoint,
 # since a LoRA adapter does not persist sep_patch_index.

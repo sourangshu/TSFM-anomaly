@@ -35,19 +35,17 @@ set -euo pipefail
 #  Configuration — edit here or export before running
 # ─────────────────────────────────────────────────────────────────────────────
 
-# This script lives in rajib_work_space/SMD_run. The training entrypoint
-# (finetune_anomaly_simple.py) and the `chronos` package live one level up, in
-# rajib_work_space. Anchor everything to absolute paths so it runs from anywhere.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../rajib_work_space/SMD_run
+# This script lives in rajib_work_space/TOTAL_RUN_maskloss_v2. The training
+# entrypoint (finetune_anomaly_simple.py, a verbatim copy of the SMD_Maskloss_v2
+# sampler version) sits alongside it; the `chronos` package is one level up.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../rajib_work_space/TOTAL_RUN_maskloss_v2
 WORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                  # .../rajib_work_space (code root)
 
 # Paths
-# PREPARED_DIR must contain train_model_inputs.pkl (and val_model_inputs.pkl unless
-# NO_VALIDATION=1). The SMD pkls live next to this script, in SMD_run.
-# PREPARED_DIR="${PREPARED_DIR:-${SCRIPT_DIR}/prepared_50_50}"
-                # train (& val) data = SMD_run
-PREPARED_DIR="${PREPARED_DIR:-/home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_Maskloss_v2/prepared_50_50}"
-OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-single-stage_SMD_maskLossv2_v1}"
+# PREPARED_DIR must contain train_model_inputs.pkl. Built by run_prepare_total.sh
+# in this same folder (dataset-capped combined pool). No val pkl -> NO_VALIDATION=1.
+PREPARED_DIR="${PREPARED_DIR:-${SCRIPT_DIR}/prepared_total}"
+OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-single-stage_mtsbench_maskLossv2_v1}"
 
 # Optional third dataset (full path to a .pkl). When set, it is evaluated and
 # logged every eval step exactly like validation (no weight updates), as eval_test_*.
@@ -67,6 +65,9 @@ PREDICTION_LENGTH="${PREDICTION_LENGTH:-64}"
 #       It must equal data-prep NORMAL_SIGNAL_LENGTH + data-prep CONTEXT_LENGTH
 #       e.g.  CONTEXT_LENGTH (768) = NORMAL_SIGNAL_LENGTH (256) + CONTEXT_LENGTH (512)
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-768}"
+# 1 epoch on the capped pool (~40.5k windows / 911k channel-rows) ≈ 2850 steps.
+# 4000 ≈ 1.4 epochs. Stay <= ~2 epochs (5700) unless the EVAL_VAL probe is on, since
+# NO_VALIDATION keeps the FINAL-step weights (no best-checkpoint restore).
 NUM_STEPS="${NUM_STEPS:-4000}"
 LR="${LR:-1e-5}"                                    # blank → script default (1e-5 lora / 1e-6 full)
 BATCH_SIZE="${BATCH_SIZE:-160}"
@@ -94,10 +95,10 @@ DEBUG="${DEBUG:-0}"                             # set to 1 to truncate train/val
 #     absolute  -> margin = MARGIN_TAU, a fixed constant (v1 behaviour)
 HINGE_MODE="${HINGE_MODE:-per_step}"
 MARGIN_MODE="${MARGIN_MODE:-relative}"
-# Relative-margin multiplier (MARGIN_MODE=relative). Default 3 for SMD: with the
-# count-weighted sampler now supplying a strong anomaly gradient, M need not be cranked
-# high. For mtsbench, override MARGIN_M=5 (isolates balancing vs the prior M=5 run).
-MARGIN_M="${MARGIN_M:-3}"
+# Relative-margin multiplier (MARGIN_MODE=relative). Default 5 for combined mtsbench
+# (matches the prior mtsbench M=5 runs, so this arm isolates the balancing change).
+# For a single dataset like SMD, 3 was enough.
+MARGIN_M="${MARGIN_M:-5}"
 # MARGIN_TAU is used only when MARGIN_MODE=absolute. Must sit ABOVE the normal-point
 # loss (~3-4 here) to matter — use ~10-15, NOT 2.
 MARGIN_TAU="${MARGIN_TAU:-6}"
