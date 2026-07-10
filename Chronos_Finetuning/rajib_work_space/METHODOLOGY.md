@@ -1,7 +1,7 @@
-# Chronos-2 Anomaly Fine-Tuning — Methodology (FT, 2x, 3x)
+# Chronos-2 Anomaly Fine-Tuning — Methodology (FT, 2x, 3x, HS)
 
-This document describes the three anomaly-aware fine-tuning methods for Chronos-2 on the
-combined **mTSBench** benchmark. All three share the same backbone, the same window
+This document describes the four anomaly-aware fine-tuning methods for Chronos-2 on the
+combined **mTSBench** benchmark. All four share the same backbone, the same window
 layout, and the **same inference/scoring stage**; they differ on only **two axes**:
 
 1. **Data preparation** — how the combined train pool is balanced.
@@ -12,15 +12,19 @@ layout, and the **same inference/scoring stage**; they differ on only **two axes
 | **FT** | `TOTAL_RUN/prepare_total.py` | `finetune_anomaly_simple.py` (repo root) | `SMD_run/forward.py` |
 | **2x** | `TOTAL_RUN_maskloss_v2/prepare_total.py` | `TOTAL_RUN_maskloss_v2/finetune_anomaly_simple.py` | `forward.py` (identical) |
 | **3x** | `TOTAL_RUN/prepare_total.py` (**= FT's**) | `SMD_Maskloss_v2/finetune_anomaly_simple.py` (**= 2x's, byte-for-byte**) | `forward.py` (identical) |
+| **HS** | `TOTAL_RUN_maskloss_v2_HS/prepare_total.py` | `TOTAL_RUN_maskloss_v2_HS/finetune_anomaly_simple.py` (**= 2x's except the sampler**) | `forward.py` (identical) |
 
-> **Key structural fact:** `SMD_run/forward.py`, `SMD_Maskloss_v2/forward.py`, and
-> `TOTAL_RUN_maskloss_v2/forward.py` are byte-for-byte identical, and the 2x and 3x
-> training scripts are byte-for-byte identical. So the *only* real differences are the
-> data-prep balancing and the loss/sampler.
+> **Key structural fact:** `SMD_run/forward.py`, `SMD_Maskloss_v2/forward.py`,
+> `TOTAL_RUN_maskloss_v2/forward.py`, and `TOTAL_RUN_maskloss_v2_HS/forward.py` are
+> byte-for-byte identical (md5 `a226d1f5e899d7ae332112e3f29d076f`), the 2x and 3x training
+> scripts are byte-for-byte identical, and HS's training script differs from 2x's only in
+> the `AnomalyChronos2Dataset` sampler. HS additionally **symlinks** the per-dataset test
+> pkls, so all four arms provably evaluate on identical bytes. The *only* real differences
+> are the data-prep balancing and the loss/sampler.
 
 ---
 
-## 0. Shared components (identical across FT, 2x, 3x)
+## 0. Shared components (identical across FT, 2x, 3x, HS)
 
 ### Backbone and sequence layout
 - **Model:** `amazon/chronos-2`, fine-tuned in **LoRA** mode (`lora_r=16`, `lora_alpha=32`,
@@ -157,28 +161,125 @@ The loss/sampler settings are otherwise identical to 2x (including `MARGIN_M=5`)
 
 ---
 
-## 4. Summary comparison
+## 4. Method HS — hierarchical sampling (no threshold, no cap, nothing discarded)
 
-| Axis | **FT** | **2x** | **3x** |
-|------|--------|--------|--------|
-| Class balancing (prep) | ✅ thresholded 2:1 (`thr=10`, `ratio=2.0`) | ❌ (runtime sampler instead) | ✅ thresholded 2:1 (`thr=10`, `ratio=2.0`) |
-| Dataset cap (prep) | ✅ anom → median (`per_dataset_cap`) | ✅ 5000/ds, anom ≤ 50% (`PER_DATASET_CAP`) | ✅ anom → median (`per_dataset_cap`) |
-| Loss | window-level hinge | per-step masked hinge | per-step masked hinge |
-| Margin | absolute `tau=8.0` | relative `margin_m=5` | relative `margin_m=5` |
-| Hinge granularity | pooled (window) | `per_step` | `per_step` |
-| Count-weighted sampler | ❌ | ✅ `target=0.4` | ✅ `target=0.4` |
-| Loss aggregation | — | `batch_global` | `batch_global` |
-| Train steps | 2400 | 4000 | 4000 |
-| Inference | shared `forward.py` | shared `forward.py` | shared `forward.py` |
+3x gives the best overall results, but it obtains its 2:1 normal-to-anomalous *window*
+guarantee from FT's **window-level anomaly threshold** (`future_labels.sum() >= 10`). A
+threshold that collapses a 64-step label vector into one bit is exactly what the per-step
+masked loss was introduced to avoid — so 3x's data and 3x's objective disagree about what
+an "anomaly" is. HS removes the threshold while keeping (and strengthening) the guarantee.
+
+### The two imbalances, and why one weight vector cannot fix both
+
+- **Dataset imbalance:** MITDB + SVDB are 87.5% of all raw train windows.
+- **Class imbalance:** anomaly *steps* are 12.5% of all forecast steps.
+
+2x attacked the class problem with a **single global** weight vector
+`w_i = n_anom_i + eps·H` and the dataset problem with a prep-time cap. But the global
+vector reaches across dataset boundaries and silently re-skews the mix the cap had just
+fixed. Solving `eps` for `sampling_target=0.4` on 2x's own capped pool yields effective
+draw shares of **1.35×** pool share for MITDB / SVDB / cicids and **0.68× / 0.36×** for
+GHL / OPPORTUNITY. 3x inherits the same sampler, applied to a pool FT had *already*
+class-balanced — so 3x is double-balanced, on a small, pre-distorted pool.
+
+### Data preparation (`TOTAL_RUN_maskloss_v2_HS/prepare_total.py`)
+
+Does nothing but carve windows. **No cap, no threshold, no class balancing, nothing
+discarded.** Writes the pool **grouped per dataset** —
+`prepared_total/per_dataset/<DS>/train_model_inputs.pkl` plus a `train_n_anom.npy`
+sidecar — because the sampler needs level-1 index groups, and a flat pkl carries no
+dataset identity. Pool: **340,523 windows, 56,723 anomaly-bearing (16.7%), 6.6 GB**, over
+the same **12** train-contributing datasets. Test halves are **symlinked** from
+`TOTAL_RUN_maskloss_v2/prepared_total` (byte-identical: same seeded file split, same
+geometry), which makes identical evaluation a fact rather than a claim.
+
+Prep hard-fails if any dataset's train half has zero anomaly windows (level 2's anomalous
+branch would be undrawable) and warns below 50. All 12 clear the hard check; room-occupancy
+(29) trips the warning.
+
+### Training (`TOTAL_RUN_maskloss_v2_HS/finetune_anomaly_simple.py`)
+
+Identical to 2x in **every** respect — loss, margin, LoRA, optimizer, `NUM_STEPS=4000`,
+`BATCH_SIZE=160`, `GRAD_ACCUM=2`, `MARGIN_M=5`, `AGG_MODE=batch_global` — **except** that
+`AnomalyChronos2Dataset._generate_train_batches` draws each window in three levels:
+
+```
+level 1   k    ~ Uniform(K = 12 datasets)              → dataset imbalance
+level 2   kind ~ Bernoulli(p_anom = 1/3)               → class imbalance, 2:1 in expectation
+level 3   i    ~ Categorical within dataset k, weight
+                    n_anom_i        if kind == anomalous
+                    64 - n_anom_i   if kind == normal
+```
+
+`SAMPLING_TARGET` and its binary-searched `eps` are **gone**; `P_ANOM` is the only knob,
+and level 1 has none.
+
+**Level 3 is thresholdless in both branches.** The anomalous branch is *self-gating* — a
+pure-normal window has `n_anom = 0`, hence weight 0 (verified: 0 pure-normal windows drawn
+from the anomalous branch in 200,000 draws). The normal branch *down-weights* an
+anomaly-bearing window by its remaining `64 - n_anom` normal steps rather than excluding
+it. This is the "soft" reading: nothing is discarded and no cutoff exists anywhere.
+
+**Level 3 renormalizes within the chosen dataset**, which is what makes the guarantee hold
+per dataset rather than only on average. Measured on the real pool, natural anomaly-step
+rates spanning **1.0% (GHL) → 27.0% (cicids)** all map onto **27–33%**; pool-wide
+**12.47% → 31.31%** analytic, 31.34% Monte-Carlo over 600k draws. Realized level-1 draw
+shares are 8.27–8.38% against a uniform target of 8.33%, for a pool whose natural shares
+run from 54.82% (MITDB) to 0.03% (room-occupancy).
+
+**Level 1 is redrawn per window, not per group.** `BATCH_SIZE` counts channel *rows*
+(`Σ group_size`), and mean `F` ≈ 24.7, so a 160-row batch holds ~7.3 windows from ~5.6
+distinct datasets. Drawing the dataset once per 3-window group would give ~2.3 — and
+`AGG_MODE=batch_global` pools the loss across the whole batch, so batch diversity is what
+keeps the gradient from being single-dataset.
+
+### Known caveat (shared with 2x and 3x, not introduced by HS)
+
+Level 1 balances **draws**, not **gradient**. Each drawn window contributes `F_d` rows of
+per-step loss, so under `batch_global` a dataset's share of the gradient is `F_d / ΣF`
+(ΣF = 296) — cicids (`F=72`) is 24.3% of the gradient, MITDB and SVDB (`F=2`) are 0.68%
+each. 2x and 3x have the same structure (non-uniform draw shares, *then* scaled by `F_d`).
+`AGG_MODE=batch_global` is retained so that **HS vs 2x is a strict one-variable ablation**;
+`AGG_MODE=per_window` would equalize it and is the natural follow-up arm.
+
+### Inference
+
+The shared `forward.py`, byte-identical (md5 `a226d1f5e899d7ae332112e3f29d076f`), run over
+symlinks to the same test pkls 2x and FT evaluated on (md5-verified per dataset).
+
+---
+
+## 5. Summary comparison
+
+| Axis | **FT** | **2x** | **3x** | **HS** |
+|------|--------|--------|--------|--------|
+| Class balancing (prep) | ✅ thresholded 2:1 (`thr=10`, `ratio=2.0`) | ❌ (runtime sampler instead) | ✅ thresholded 2:1 (`thr=10`, `ratio=2.0`) | ❌ (runtime, levels 2–3) |
+| Dataset cap (prep) | ✅ anom → median (`per_dataset_cap`) | ✅ 5000/ds, anom ≤ 50% (`PER_DATASET_CAP`) | ✅ anom → median (`per_dataset_cap`) | ❌ **none — all 340,523 windows kept** |
+| Window-level anomaly threshold | ✅ `≥10` steps | ❌ | ✅ `≥10` steps (inherited) | ❌ **none anywhere** |
+| Loss | window-level hinge | per-step masked hinge | per-step masked hinge | per-step masked hinge |
+| Margin | absolute `tau=8.0` | relative `margin_m=5` | relative `margin_m=5` | relative `margin_m=5` |
+| Hinge granularity | pooled (window) | `per_step` | `per_step` | `per_step` |
+| Sampler | ❌ uniform | ✅ global count-weighted, `target=0.4` | ✅ global count-weighted, `target=0.4` | ✅ **hierarchical**, `p_anom=1/3` |
+| Dataset balance mechanism | prep cap | prep cap (*undone by sampler*: 1.35× / 0.68×) | prep cap (*undone by sampler*) | **level 1, exact** (8.27–8.38% vs 8.33%) |
+| Loss aggregation | — | `batch_global` | `batch_global` | `batch_global` |
+| Train steps | 2400 | 4000 | 4000 | 4000 |
+| Train pool | ~471 MB | 40,521 win / 2.9 GB | ~471 MB | 340,523 win / 6.6 GB |
+| Inference | shared `forward.py` | shared `forward.py` | shared `forward.py` | shared `forward.py` (symlinked test pkls) |
 
 **Interpretation of the ablation:**
 - **FT → 3x** isolates the effect of the **loss/sampler** change (same data).
 - **2x → 3x** isolates the effect of the **data-prep** change (same loss/sampler):
   i.e. whether adding prep-time 2:1 class balancing on top of the runtime sampler helps.
+- **2x → HS** isolates the effect of the **sampler** change (same loss, same
+  hyperparameters, only `AnomalyChronos2Dataset` differs): whether decomposing the two
+  imbalances into independent levels beats a single global weight vector.
+- **3x → HS** asks whether the 2:1 window guarantee survives the removal of the
+  window-level threshold that produced it — i.e. whether 3x's gain came from the balance
+  or from the thresholding.
 
 ---
 
-## 5. Reproducibility — how each method is launched
+## 6. Reproducibility — how each method is launched
 
 ```bash
 # ---- FT ----
@@ -196,7 +297,30 @@ bash TOTAL_RUN/run_prepare_total.sh                # FT's data prep (reused)
 PREPARED_DIR=.../TOTAL_RUN/prepared_total \
   bash SMD_Maskloss_v2/run_finetune_smd.sh         # 2x's maskloss training on FT data
 bash TOTAL_RUN/run_forward_total.sh                # eval (identical forward.py)
+
+# ---- HS ----
+bash TOTAL_RUN_maskloss_v2_HS/run_prepare_total.sh   # uncapped per-dataset pool;
+                                                     # test pkls symlinked from 2x
+bash TOTAL_RUN_maskloss_v2_HS/run_finetune_total.sh  # per-step maskloss + HS sampler (p_anom=1/3)
+bash TOTAL_RUN_maskloss_v2_HS/run_forward_total.sh   # eval (identical forward.py)
 ```
 
+All four use `debug_chronos`: `export PATH="/home/rajib/miniconda3/envs/debug_chronos/bin:$PATH"`.
+
 Results land in `TOTAL_RUN/results_finetuned/`, `TOTAL_RUN_maskloss_v2/results_FT/`,
-and the corresponding 3x output — aggregated per method into `ALL_results.csv`.
+`TOTAL_RUN_maskloss_v2_HS/results_FT/`, and the corresponding 3x output — aggregated per
+method into `ALL_results.csv`.
+
+**Watching an HS run.** The startup log prints each dataset's natural → HS anomaly-step
+fraction. Every 500 batches the sampler prints its *realized* anomaly-step fraction and its
+*realized dataset mix*:
+
+```
+[hs] realized over 500 batches: anomaly-step fraction 31.2% (expected 31.3%);
+     dataset mix (uniform target 8.3%): MITDB=8.4%  SVDB=8.3%  cicids=8.4%  ...
+```
+
+If the dataset mix drifts, level 1 is broken; if the anomaly-step fraction drifts, level 3
+is. A step with no `anomaly_loss` key is expected in ~4.5% of micro-batches (a batch with
+no anomaly steps at all) — `n_anom_steps.clamp(min=eps)` handles it, the batch just
+contributes `L_good`.
