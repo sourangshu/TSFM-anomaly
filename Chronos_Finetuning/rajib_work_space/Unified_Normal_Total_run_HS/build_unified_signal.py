@@ -1,8 +1,8 @@
 """
 Build the UNIFIED (global) normal-signal SHAPE for *any* dataset.
 
-Given a directory of `*test.csv` files, this derives one common normal shape that
-represents the whole dataset, with no per-dataset hardcoding:
+Given a list/directory of `*test.csv` files, this derives one common normal shape
+that represents the whole dataset, with no per-dataset hardcoding:
 
   1. Carve each series' normal signal (F, L) and z-normalize it per channel.
   2. Score how representative each series is of all the others, under a
@@ -11,44 +11,31 @@ represents the whole dataset, with no per-dataset hardcoding:
      its normalized shape as the global signal.
 
 The medoid is preferred over a synthetic average because averaging weakly-related
-normals collapses to a near-flat, structureless signal.
+normals collapses to a near-flat, structureless signal that resembles no real
+series (established empirically in the earlier SMD Unified_Normal experiment).
 
-Importable: `build_unified_signal(data_dir=..., length=256)` -> dict.
+Standalone: all carving primitives come from the local prep_common.py — no
+imports from sibling folders.
+
+Importable: `build_unified_signal(csv_files=[...], length=256)` -> dict.
 Standalone:  writes the chosen shape to <out>/global_normal_signal.npz.
 """
 
 import argparse
 import glob
 import os
-import sys
 
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def _find_work_root(start: str, marker: str = "inst_data_prepare_labeled.py") -> str:
-    """Walk up from `start` to the dir containing `marker` (rajib_work_space),
-    so this script works regardless of how deep the folder is moved."""
-    d = start
-    while True:
-        if os.path.exists(os.path.join(d, marker)):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            raise RuntimeError(f"Could not locate {marker} above {start}")
-        d = parent
-
-
-WORK_ROOT = _find_work_root(HERE)                          # .../rajib_work_space
-sys.path.insert(0, WORK_ROOT)
-from inst_data_prepare_labeled import (                    # noqa: E402
+from prep_common import (
     load_csv_as_multivariate,
     extract_anomaly_boundaries,
     get_normal_zones,
     extract_normal_signal,
+    normal_zone_stats,
 )
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 EPS = 1e-8
 
 
@@ -56,15 +43,7 @@ EPS = 1e-8
 #  Per-series extraction + normalization
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _normal_zone_stats(data: np.ndarray, zones: list[tuple[int, int]]) -> tuple[np.ndarray, np.ndarray]:
-    cols = np.concatenate([data[:, s:e] for s, e in zones], axis=1) if zones else data
-    mean = np.nan_to_num(np.nanmean(cols, axis=1), nan=0.0)
-    std = np.nan_to_num(np.nanstd(cols, axis=1), nan=1.0)
-    std = np.where(std < EPS, 1.0, std)
-    return mean.astype(np.float32), std.astype(np.float32)
-
-
-def extract_all_normals(csv_files: list[str], length: int):
+def extract_all_normals(csv_files: list, length: int):
     """Return (names, norm (N,F,L)) of z-normalized per-series normal signals."""
     names, norms, n_feat = [], [], None
     for path in csv_files:
@@ -79,7 +58,7 @@ def extract_all_normals(csv_files: list[str], length: int):
             n_feat = sig.shape[0]
         elif sig.shape[0] != n_feat:
             continue                                       # channel mismatch -> skip
-        mean, std = _normal_zone_stats(feat, zones)
+        mean, std = normal_zone_stats(feat, zones)
         norm = np.nan_to_num((sig - mean[:, None]) / std[:, None], nan=0.0).astype(np.float32)
         names.append(os.path.basename(path))
         norms.append(norm)
@@ -123,11 +102,15 @@ def select_medoid(sim: np.ndarray) -> int:
 
 def build_unified_signal(
     data_dir: str | None = None,
-    csv_files: list[str] | None = None,
+    csv_files: list | None = None,
     length: int = 256,
     metric: str = "fft",
 ) -> dict:
     """Derive the dataset's global normal shape (the medoid), with no hardcoding.
+
+    Pass `csv_files` = the TRAINING files only, so the test series cannot leak
+    into the shared reference. With a single file the medoid is trivially that
+    file (mean_similarity = nan).
 
     Returns dict with: signal (F,L) normalized, reference (str), mean_similarity
     (medoid's mean sim to others), names (list), similarity (N,N).
@@ -140,6 +123,15 @@ def build_unified_signal(
         raise ValueError(f"No *test.csv files found under {data_dir}")
 
     names, norm = extract_all_normals(csv_files, length)
+    if len(names) == 1:                                    # single-file dataset: medoid = itself
+        return {
+            "signal": norm[0],
+            "reference": names[0],
+            "mean_similarity": float("nan"),
+            "names": names,
+            "similarity": np.eye(1),
+            "metric": metric,
+        }
     sim = similarity_matrix(norm, metric=metric)
     mi = select_medoid(sim)
     off = sim[mi].copy(); off[mi] = np.nan
