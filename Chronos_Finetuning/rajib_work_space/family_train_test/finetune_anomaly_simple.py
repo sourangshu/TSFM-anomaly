@@ -1,0 +1,1 @@
+../TOTAL_RUN_maskloss_v2_HS/finetune_anomaly_simple.py

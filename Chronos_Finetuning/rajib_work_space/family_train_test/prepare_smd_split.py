@@ -1,0 +1,1 @@
+../SMD_run/prepare_smd_split.py
