@@ -48,7 +48,11 @@ EVAL_STEPS="${EVAL_STEPS:-50}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 FP16="${FP16:-1}"
-NO_VALIDATION="${NO_VALIDATION:-1}"             # no val pkl is carved
+# 0 = validate on ${PREPARED_DIR}/val_model_inputs.pkl, which make_folds.py assembles from
+# the TRAIN datasets of THIS fold only (an equal window budget each, ~1/3 anomalous where
+# the val file allows). Held-out datasets contribute no val window, so best-model selection
+# cannot see them. Set to 1 only when the prep ran with NO_VAL=1.
+NO_VALIDATION="${NO_VALIDATION:-0}"
 DEBUG="${DEBUG:-0}"
 
 HINGE_MODE="${HINGE_MODE:-per_step}"
@@ -80,6 +84,14 @@ fi
 if [ ! -d "${PREPARED_DIR}/per_dataset" ]; then
     echo "ERROR: ${PREPARED_DIR}/per_dataset not found."
     echo "       Run ./run_prepare_family.sh first (it also builds the fold dirs)."
+    exit 1
+fi
+
+if [ "${NO_VALIDATION}" != "1" ] && [ ! -f "${PREPARED_DIR}/val_model_inputs.pkl" ]; then
+    echo "ERROR: ${PREPARED_DIR}/val_model_inputs.pkl not found, but NO_VALIDATION=0."
+    echo "       Add the val set WITHOUT re-carving the pool:"
+    echo "           VAL_ONLY=1 ./run_prepare_family.sh"
+    echo "       Or train without validation:  NO_VALIDATION=1 ./run_finetune_family.sh"
     exit 1
 fi
 

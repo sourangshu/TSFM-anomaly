@@ -11,7 +11,11 @@
     "min_length": 50,
     "p_anom": 0.3333333333333333,
     "min_anom_windows": 50,
-    "min_anom_steps_test": 500
+    "min_anom_steps_test": 500,
+    "val_per_dataset": 200,
+    "val_stride": 16,
+    "val_p_anom": 0.3333333333333333,
+    "seed": 42
   },
   "families": {
     "ecg": {
@@ -144,7 +148,15 @@
       "train_anom_windows": 1513,
       "train_norm_windows": 7865,
       "natural_anom_step_frac": 0.1423,
-      "hs_expected_anom_step_frac": 0.3234
+      "hs_expected_anom_step_frac": 0.3234,
+      "val_file": "Daphnet_S05R01E1_val.csv",
+      "val_windows_available": 208,
+      "val_anom_windows_available": 141,
+      "val_windows": 200,
+      "val_anom_windows": 133,
+      "val_norm_windows": 67,
+      "val_anom_win_frac": 0.665,
+      "val_anom_step_frac": 0.6154
     },
     "Exathlon": {
       "roles": [
@@ -190,7 +202,15 @@
       "train_anom_windows": 1277,
       "train_norm_windows": 9029,
       "natural_anom_step_frac": 0.1168,
-      "hs_expected_anom_step_frac": 0.3293
+      "hs_expected_anom_step_frac": 0.3293,
+      "val_file": "Exathlon_4_1_100000_61_val.csv",
+      "val_windows_available": 1579,
+      "val_anom_windows_available": 231,
+      "val_windows": 200,
+      "val_anom_windows": 67,
+      "val_norm_windows": 133,
+      "val_anom_win_frac": 0.335,
+      "val_anom_step_frac": 0.335
     },
     "GECCO": {
       "roles": [
@@ -204,7 +224,15 @@
       "train_anom_windows": 57,
       "train_norm_windows": 1233,
       "natural_anom_step_frac": 0.0155,
-      "hs_expected_anom_step_frac": 0.1791
+      "hs_expected_anom_step_frac": 0.1791,
+      "val_file": "GECCO_water_quality_val.csv",
+      "val_windows_available": 1696,
+      "val_anom_windows_available": 44,
+      "val_windows": 200,
+      "val_anom_windows": 44,
+      "val_norm_windows": 156,
+      "val_anom_win_frac": 0.22,
+      "val_anom_step_frac": 0.0947
     },
     "GHL": {
       "roles": [
@@ -231,7 +259,15 @@
       "train_anom_windows": 267,
       "train_norm_windows": 17652,
       "natural_anom_step_frac": 0.0136,
-      "hs_expected_anom_step_frac": 0.3215
+      "hs_expected_anom_step_frac": 0.3215,
+      "val_file": "GHL_41_Lev_corr_Temp_fault_seed_181_vars_23_val.csv",
+      "val_windows_available": 5340,
+      "val_anom_windows_available": 31,
+      "val_windows": 200,
+      "val_anom_windows": 31,
+      "val_norm_windows": 169,
+      "val_anom_win_frac": 0.155,
+      "val_anom_step_frac": 0.1434
     },
     "Genesis": {
       "roles": [
@@ -304,7 +340,15 @@
       "train_anom_windows": 56807,
       "train_norm_windows": 324692,
       "natural_anom_step_frac": 0.1313,
-      "hs_expected_anom_step_frac": 0.3228
+      "hs_expected_anom_step_frac": 0.3228,
+      "val_file": "MITDB_200_val.csv",
+      "val_windows_available": 8090,
+      "val_anom_windows_available": 3422,
+      "val_windows": 200,
+      "val_anom_windows": 67,
+      "val_norm_windows": 133,
+      "val_anom_win_frac": 0.335,
+      "val_anom_step_frac": 0.3115
     },
     "MSL": {
       "roles": [
@@ -444,7 +488,15 @@
       "train_anom_windows": 850,
       "train_norm_windows": 5097,
       "natural_anom_step_frac": 0.1336,
-      "hs_expected_anom_step_frac": 0.3275
+      "hs_expected_anom_step_frac": 0.3275,
+      "val_file": "SMAP_G-7_val.csv",
+      "val_windows_available": 215,
+      "val_anom_windows_available": 10,
+      "val_windows": 200,
+      "val_anom_windows": 10,
+      "val_norm_windows": 190,
+      "val_anom_win_frac": 0.05,
+      "val_anom_step_frac": 0.0316
     },
     "SMD": {
       "roles": [
@@ -475,7 +527,15 @@
       "train_anom_windows": 389,
       "train_norm_windows": 3468,
       "natural_anom_step_frac": 0.056,
-      "hs_expected_anom_step_frac": 0.2936
+      "hs_expected_anom_step_frac": 0.2936,
+      "val_file": "SMD_machine-1-2_val.csv",
+      "val_windows_available": 170,
+      "val_anom_windows_available": 8,
+      "val_windows": 170,
+      "val_anom_windows": 8,
+      "val_norm_windows": 162,
+      "val_anom_win_frac": 0.0471,
+      "val_anom_step_frac": 0.0327
     },
     "SVDB": {
       "roles": [
@@ -579,7 +639,15 @@
       "train_anom_windows": 25,
       "train_norm_windows": 343,
       "natural_anom_step_frac": 0.0013,
-      "hs_expected_anom_step_frac": 0.0084
+      "hs_expected_anom_step_frac": 0.0084,
+      "val_file": "metro_traffic-volume_val.csv",
+      "val_windows_available": 1471,
+      "val_anom_windows_available": 108,
+      "val_windows": 200,
+      "val_anom_windows": 67,
+      "val_norm_windows": 133,
+      "val_anom_win_frac": 0.335,
+      "val_anom_step_frac": 0.0057
     },
     "room-occupancy": {
       "roles": [
@@ -594,7 +662,15 @@
       "train_anom_windows": 50,
       "train_norm_windows": 156,
       "natural_anom_step_frac": 0.2052,
-      "hs_expected_anom_step_frac": 0.3207
+      "hs_expected_anom_step_frac": 0.3207,
+      "val_file": "room-occupancy_val.csv",
+      "val_windows_available": 66,
+      "val_anom_windows_available": 43,
+      "val_windows": 66,
+      "val_anom_windows": 43,
+      "val_norm_windows": 23,
+      "val_anom_win_frac": 0.6515,
+      "val_anom_step_frac": 0.5104
     }
   }
 }

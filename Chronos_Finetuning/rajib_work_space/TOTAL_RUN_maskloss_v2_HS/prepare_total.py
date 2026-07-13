@@ -79,6 +79,7 @@ import logging
 import os
 import pickle
 import sys
+import zlib
 
 import numpy as np
 
@@ -216,7 +217,210 @@ def _link_or_build_test(ds, ds_out, test_files, args, min_req, src_manifest):
     return len(test_inputs), len(test_meta), n_anom
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Validation half — mTSBench's own *val.csv, carved hierarchically
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_val_csv(ddir: str):
+    """The dataset's own validation file, or None.
+
+    mTSBench ships exactly one *val.csv per dataset, disjoint from the *test.csv
+    files that split_files() divides into our train/test halves — so nothing here
+    perturbs the seeded file split shared by every arm."""
+    hits = sorted(glob.glob(os.path.join(ddir, "**", "*val.csv"), recursive=True))
+    if not hits:
+        return None
+    if len(hits) > 1:
+        logger.warning(f"  {len(hits)} *val.csv found; using {os.path.basename(hits[0])}")
+    return hits[0]
+
+
+def hs_carve_val(n_anom: np.ndarray, budget: int, p_anom: float, rng):
+    """Hierarchically pick ONE dataset's val windows. Returns sorted indices.
+
+    Level 1 is the equal `budget` itself (the caller hands every dataset the same
+    one). Level 2 splits that budget p_anom / 1 - p_anom across the anomalous and
+    normal kinds. Level 3 draws inside a kind, count-weighted by n_anom exactly as
+    the train sampler does — the normal kind is n_anom = 0 throughout, so its
+    weights are uniform.
+
+    Unlike the sampler this draws WITHOUT replacement (a val window must not be
+    scored twice), so a kind that cannot fill its share is drained completely and
+    the remainder is handed to the other kind. The equal budget therefore always
+    holds; the mix bends. Both extremes occur in mTSBench: GutenTAG's val file has
+    2 anomaly windows, cicids' has 86 normal ones."""
+    anom_idx = np.flatnonzero(n_anom >= 1)
+    norm_idx = np.flatnonzero(n_anom == 0)
+    budget = int(min(budget, len(n_anom)))
+
+    want_a = min(int(round(p_anom * budget)), len(anom_idx))
+    want_n = min(budget - want_a, len(norm_idx))
+    want_a = min(want_a + (budget - want_a - want_n), len(anom_idx))   # top up if normals ran out
+
+    w = n_anom[anom_idx].astype(np.float64)                            # level 3, anomalous kind
+    sel_a = rng.choice(anom_idx, size=want_a, replace=False, p=w / w.sum()) \
+        if want_a else np.empty(0, dtype=np.int64)
+    sel_n = rng.choice(norm_idx, size=want_n, replace=False) \
+        if want_n else np.empty(0, dtype=np.int64)
+    return np.sort(np.concatenate([sel_a, sel_n])).astype(np.int64)
+
+
+def build_val_windows(ds, ddir, args, min_req):
+    """Carve, subsample and dataset-tag this dataset's val windows.
+
+    The 256-step normal prefix is carved PER SERIES from the val series' own normal
+    zones — the same recipe this arm uses for its train and test windows.
+
+    Returns (selected_inputs, stats) — stats is None when the dataset ships no
+    *val.csv or the file is too short to yield a single window."""
+    val_csv = find_val_csv(ddir)
+    if val_csv is None:
+        logger.warning(f"  VAL   -> no *val.csv under {ddir}; {ds} will be ABSENT from "
+                       f"the val set (its level-1 group is unrepresented)")
+        return [], None
+
+    val_pairs, _, _, _ = build_pairs_for_files(
+        [val_csv], args.context_length, args.prediction_length,
+        args.val_stride, min_req, f"{ds}/val")
+    val_inputs = pairs_to_model_inputs(val_pairs, include_meta=False)
+    del val_pairs
+    if not val_inputs:
+        logger.warning(f"  VAL   -> {os.path.basename(val_csv)} yields no window at "
+                       f"context+horizon {min_req}; {ds} ABSENT from the val set")
+        return [], None
+
+    n_anom = anomaly_step_counts(val_inputs)
+    n_avail, n_anom_avail = len(val_inputs), int((n_anom >= 1).sum())
+    if n_anom_avail == 0:
+        logger.warning(f"  [{ds}] val file has ZERO anomaly windows — its val slice can "
+                       f"only measure normal-regime loss.")
+
+    # Seed off the dataset NAME, not its position, so the draw is stable under
+    # --datasets subsetting and reordering.
+    rng = np.random.default_rng([args.seed, zlib.crc32(ds.encode())])
+    keep = hs_carve_val(n_anom, args.val_per_dataset, args.val_p_anom, rng)
+
+    selected = [dict(val_inputs[i], dataset=ds) for i in keep]
+    kept_anom = int((n_anom[keep] >= 1).sum())
+    stats = {
+        "val_file": os.path.basename(val_csv),
+        "val_windows_available": n_avail,
+        "val_anom_windows_available": n_anom_avail,
+        "val_windows": len(keep),
+        "val_anom_windows": kept_anom,
+        "val_norm_windows": len(keep) - kept_anom,
+        "val_anom_win_frac": round(kept_anom / max(1, len(keep)), 4),
+        "val_anom_step_frac": round(
+            float(n_anom[keep].sum()) / max(1, len(keep) * args.prediction_length), 4),
+    }
+    short = " [BUDGET SHORT]" if len(keep) < args.val_per_dataset else ""
+    logger.info(
+        f"  VAL   -> {len(keep)}/{n_avail} windows from {os.path.basename(val_csv)} "
+        f"(anom={kept_anom}, normal={len(keep) - kept_anom}; "
+        f"{100.0 * stats['val_anom_win_frac']:.1f}% anomaly-bearing vs target "
+        f"{100.0 * args.val_p_anom:.1f}%, {n_anom_avail} anomaly windows existed){short}"
+    )
+    return selected, stats
+
+
+def write_val_pool(args, val_pool, val_datasets, train_datasets, manifest) -> None:
+    """Write val_model_inputs.pkl and record the pool in the manifest (in place)."""
+    if not val_pool:
+        logger.warning("VAL POOL: empty (no *val.csv found for any trained dataset) "
+                       "-> run finetune with NO_VALIDATION=1")
+        return
+
+    val_anom = sum(1 for d in val_pool if int(np.asarray(d["future_labels"]).sum()) >= 1)
+
+    # Interleave the datasets (seeded -> still a fixed pkl). Eval batches sequentially,
+    # so a dataset-grouped pool would make every batch single-dataset and would hand
+    # --debug's first-50 truncation one dataset's windows only.
+    order = np.random.default_rng(args.seed).permutation(len(val_pool))
+    val_pool = [val_pool[i] for i in order]
+
+    val_path = os.path.join(args.output_dir, "val_model_inputs.pkl")
+    with open(val_path, "wb") as f:
+        pickle.dump(val_pool, f)
+
+    missing = [d for d in train_datasets if d not in val_datasets]
+    logger.info("=" * 78)
+    logger.info("VAL POOL (hierarchical: equal budget per dataset, "
+                f"p_anom={args.val_p_anom:.3f} best-effort)")
+    logger.info(f"  datasets in val  : {len(val_datasets)}/{len(train_datasets)} of the "
+                f"train pool" + (f"  MISSING: {missing}" if missing else ""))
+    logger.info(f"  budget/dataset   : {args.val_per_dataset} windows "
+                f"(stride {args.val_stride})")
+    logger.info(f"  total windows    : {len(val_pool)}  "
+                f"(anom={val_anom}, normal={len(val_pool) - val_anom}, "
+                f"{100.0 * val_anom / max(1, len(val_pool)):.1f}% anomaly-bearing)")
+    logger.info(f"  -> {val_path}  (run finetune with NO_VALIDATION=0)")
+
+    manifest["val_pool"] = {
+        "datasets": val_datasets,
+        "n_datasets": len(val_datasets),
+        "missing_from_train_pool": missing,
+        "per_dataset_budget": args.val_per_dataset,
+        "stride": args.val_stride,
+        "target_p_anom": args.val_p_anom,
+        "anomaly_windows": val_anom,
+        "normal_windows": len(val_pool) - val_anom,
+        "total_windows": len(val_pool),
+        "realized_anom_win_frac": round(val_anom / max(1, len(val_pool)), 4),
+        "source": "mTSBench *val.csv (disjoint from the *test.csv train/test split)",
+        "sampling": "hierarchical, without replacement: equal per-dataset budget "
+                    "(level 1) -> p_anom split (level 2) -> n_anom-weighted draw "
+                    "within the anomalous kind (level 3)",
+    }
+
+
+def prepare_val_only(args) -> None:
+    """Add the val set to an EXISTING prepared_total without re-carving train/test.
+
+    Safe to run against a prepared_total a fine-tune is already reading: no train or
+    test pkl is opened for writing.
+    """
+    per_ds_root = os.path.join(args.output_dir, "per_dataset")
+    mpath = os.path.join(args.output_dir, "manifest.json")
+    if not os.path.isdir(per_ds_root) or not os.path.exists(mpath):
+        raise SystemExit(
+            f"--val_only needs an existing prepared_total: {per_ds_root} and {mpath} "
+            f"must both exist. Run a full prep first (drop --val_only)."
+        )
+    with open(mpath) as f:
+        manifest = json.load(f)
+
+    train_datasets = [ds for ds, e in manifest.get("datasets", {}).items()
+                      if e.get("in_train_pool")]
+    if args.datasets:
+        train_datasets = [ds for ds in train_datasets if ds in args.datasets]
+    logger.info(f"VAL-ONLY: adding a val set to {args.output_dir} for "
+                f"{len(train_datasets)} trained datasets. Train/test pkls untouched.")
+
+    min_req = max(args.min_length, args.context_length + args.prediction_length)
+    val_pool, val_datasets = [], []
+
+    for ds in train_datasets:
+        logger.info("=" * 78)
+        logger.info(f"{ds}")
+        sel, vstats = build_val_windows(ds, os.path.join(args.data_root, ds),
+                                        args, min_req)
+        if vstats is not None:
+            val_pool.extend(sel)
+            val_datasets.append(ds)
+            manifest["datasets"][ds].update(vstats)
+
+    for k in ("val_per_dataset", "val_stride", "val_p_anom"):
+        manifest.setdefault("config", {})[k] = getattr(args, k)
+    write_val_pool(args, val_pool, val_datasets, train_datasets, manifest)
+    with open(mpath, "w") as f:
+        json.dump(manifest, f, indent=2, default=str)
+    logger.info(f"Manifest updated -> {mpath}")
+
+
 def prepare(args) -> None:
+    if args.val_only:
+        return prepare_val_only(args)
+
     os.makedirs(args.output_dir, exist_ok=True)
     per_ds_root = os.path.join(args.output_dir, "per_dataset")
     os.makedirs(per_ds_root, exist_ok=True)
@@ -243,6 +447,8 @@ def prepare(args) -> None:
     train_datasets: list = []          # only those that contribute to the pool
     grand_anom = grand_norm = 0
     grand_anom_steps = grand_total_steps = 0
+    val_pool: list = []                # flat, dataset-tagged, hierarchically balanced
+    val_datasets: list = []
 
     for ds in datasets:
         ddir = os.path.join(args.data_root, ds)
@@ -336,6 +542,16 @@ def prepare(args) -> None:
                 f"-> {100.0 * exp_frac:.1f}% under HS (p_anom={args.p_anom:.3f})"
             )
             del train_inputs, n_anom
+
+            # ── VAL half — mTSBench's own *val.csv, per-series prefix ────────
+            # Only train-pool datasets get one: the val set exists to track the
+            # training objective, and a test-only dataset has no level-1 group.
+            if not args.no_val:
+                sel, vstats = build_val_windows(ds, ddir, args, min_req)
+                if vstats is not None:
+                    val_pool.extend(sel)
+                    val_datasets.append(ds)
+                    entry.update(vstats)
         else:
             logger.info("  TRAIN -> none (test-only dataset; invisible to level 1)")
 
@@ -356,8 +572,12 @@ def prepare(args) -> None:
                 f"of the time regardless of size")
     logger.info(f"  per-window target: [{NORMAL_SIGNAL_LENGTH} normal | {args.context_length} "
                 f"context | {args.prediction_length} future]; F varies per dataset")
-    logger.info("  no val_model_inputs.pkl -> run finetune with NO_VALIDATION=1 "
-                "(EVAL_TEST stays manual via TEST_DATA)")
+
+    # ── VAL pool ─────────────────────────────────────────────────────────────
+    if args.no_val:
+        logger.info("VAL POOL: skipped (--no_val) -> run finetune with NO_VALIDATION=1")
+    else:
+        write_val_pool(args, val_pool, val_datasets, train_datasets, manifest)
 
     manifest["train_pool"] = {
         "datasets": train_datasets,
@@ -417,7 +637,33 @@ def main():
     p.add_argument("--min_anom_windows", type=int, default=50,
                    help="Warn (do not fail) when a dataset's train half has fewer than "
                         "this many anomaly windows — they will be revisited heavily.")
+
+    # Validation set — carved from mTSBench's own *val.csv (never from the *test.csv
+    # files the train/test split divides), one equal budget per trained dataset.
+    p.add_argument("--no_val", action="store_true",
+                   help="Skip the val set entirely (then run finetune with NO_VALIDATION=1).")
+    p.add_argument("--val_only", action="store_true",
+                   help="Add ONLY the val set to an existing prepared_total. Train/test "
+                        "pkls are never rewritten, so this is safe to run against data a "
+                        "fine-tune is already reading.")
+    p.add_argument("--val_per_dataset", type=int, default=200,
+                   help="Level 1: windows taken from EVERY trained dataset's val file, so "
+                        "each contributes equally to eval_loss. A dataset with fewer "
+                        "windows than this hands over all it has.")
+    p.add_argument("--val_stride", type=int, default=16,
+                   help="Val sliding-window stride. Smaller than --stride on purpose: the "
+                        "val files are single series and the small ones (MSL, SMD, "
+                        "GutenTAG) cannot fill their budget at stride 64. Val windows may "
+                        "overlap — they are only scored, never tiled like the test half.")
+    p.add_argument("--val_p_anom", type=float, default=1.0 / 3.0,
+                   help="Level 2: target anomalous share inside each dataset's val budget. "
+                        "Matches the sampler's --p_anom so eval_loss is measured on the "
+                        "mix the model is trained on. Best-effort: datasets short of "
+                        "anomaly windows fill the rest with normal ones.")
     args = p.parse_args()
+
+    if not 0.0 <= args.val_p_anom <= 1.0:
+        raise SystemExit(f"--val_p_anom must be in [0, 1], got {args.val_p_anom}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     log_path = os.path.join(args.output_dir, "prepare_total.log")

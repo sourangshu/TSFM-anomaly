@@ -37,11 +37,15 @@ Usage:
 import argparse
 import json
 import os
+import pickle
+
+import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 TRAIN_ARTIFACTS = ("train_model_inputs.pkl", "train_n_anom.npy")
 TEST_ARTIFACTS = ("test_model_inputs.pkl", "test_series_meta.pkl")
+VAL_ARTIFACT = "val_model_inputs.pkl"
 
 
 def link(src: str, dst: str) -> None:
@@ -51,6 +55,53 @@ def link(src: str, dst: str) -> None:
     if os.path.islink(dst) or os.path.exists(dst):
         os.remove(dst)
     os.symlink(os.path.abspath(src), dst)
+
+
+def build_val(prepared_dir: str, pool_root: str, train, seed: int) -> None:
+    """Concatenate the fold's TRAIN datasets' val pkls into prepared/val_model_inputs.pkl.
+
+    Only the fold's own train datasets contribute — the unified run validates on its 9
+    pool datasets, a --per_family run on that family's siblings alone, and a held-out
+    dataset never appears in either (it has no val pkl in the pool at all). eval_loss
+    steers best-model selection, so this is the same leak-free boundary the train/test
+    artifact split already enforces.
+
+    This one file is a real concatenation, not a symlink: the trainer wants a single
+    val pkl, and which datasets belong in it is a property of the FOLD, not of the pool.
+    It is ~9 x 200 windows, so the copy is cheap.
+    """
+    pool = []
+    missing = []
+    for ds in sorted(train):
+        src = os.path.join(pool_root, ds, VAL_ARTIFACT)
+        if not os.path.exists(src):
+            missing.append(ds)
+            continue
+        with open(src, "rb") as f:
+            items = pickle.load(f)
+        for d in items:
+            d["dataset"] = ds            # level-1 group id; the trainer strips it
+        pool.extend(items)
+
+    if not pool:
+        print(f"  VAL        : none in the pool -> fine-tune with NO_VALIDATION=1")
+        return
+
+    # Interleave the datasets: eval batches sequentially, so a dataset-grouped pool would
+    # make every eval batch single-dataset. Seeded -> the val pkl stays deterministic.
+    order = np.random.default_rng(seed).permutation(len(pool))
+    pool = [pool[i] for i in order]
+
+    dst = os.path.join(prepared_dir, VAL_ARTIFACT)
+    with open(dst, "wb") as f:
+        pickle.dump(pool, f)
+
+    n_anom = sum(1 for d in pool if int(np.asarray(d["future_labels"]).sum()) >= 1)
+    print(f"  VAL        : {len(pool)} windows from {len(train) - len(missing)} TRAIN "
+          f"datasets ({n_anom} anomalous, {n_anom / len(pool):.0%}) -> {dst}")
+    if missing:
+        print(f"               NO val pkl in the pool for {missing} — absent from the val "
+              f"set. Re-run the prep (VAL_ONLY=1 is enough) to add them.")
 
 
 def assemble(per_ds_out: str, pool_root: str, train, holdouts) -> None:
@@ -75,6 +126,8 @@ def main():
     p.add_argument("--families", default=os.path.join(_HERE, "families.json"))
     p.add_argument("--per_family", action="store_true",
                    help="Also build one dir per family (the attribution variant).")
+    p.add_argument("--seed", type=int, default=42,
+                   help="Shuffle seed for the assembled val set (keeps the pkl fixed).")
     args = p.parse_args()
 
     with open(args.families) as f:
@@ -96,13 +149,14 @@ def main():
             f"pooled model that is leakage. Fix families.json.")
 
     # ── the unified run: one model, one directory ────────────────────────────
-    assemble(os.path.join(args.run_dir, "prepared", "per_dataset"),
-             pool_root, train_pool, holdouts)
+    prepared = os.path.join(args.run_dir, "prepared")
+    assemble(os.path.join(prepared, "per_dataset"), pool_root, train_pool, holdouts)
 
     print("UNIFIED RUN  (one model)")
     print(f"  TRAIN pool ({len(train_pool)}): {' '.join(sorted(train_pool))}")
     print(f"  HELD OUT   ({len(holdouts)}): {' '.join(sorted(holdouts))}")
-    print(f"  -> {args.run_dir}/prepared")
+    build_val(prepared, pool_root, train_pool, args.seed)
+    print(f"  -> {prepared}")
     print()
     print("  family        train on                             held out        tier")
     print("  " + "-" * 74)
@@ -115,9 +169,12 @@ def main():
     if args.per_family:
         print("\nPER-FAMILY RUNS  (attribution variant -- one model each)")
         for name, fam in fams.items():
-            assemble(os.path.join(args.per_family_dir, name, "prepared", "per_dataset"),
+            fam_prepared = os.path.join(args.per_family_dir, name, "prepared")
+            assemble(os.path.join(fam_prepared, "per_dataset"),
                      pool_root, fam["train"], [fam["holdout"]])
-            print(f"  {name:<13} -> {args.per_family_dir}/{name}/prepared")
+            # This fold's val = its own train siblings only, never its holdout.
+            build_val(fam_prepared, pool_root, fam["train"], args.seed)
+            print(f"  {name:<13} -> {fam_prepared}")
 
     print("\nNext:  bash run_study.sh")
 

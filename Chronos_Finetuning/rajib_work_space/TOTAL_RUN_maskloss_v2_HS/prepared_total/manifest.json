@@ -60,7 +60,15 @@
       "train_mean_anom_steps_per_anom_window": 57.02,
       "natural_anom_step_frac": 0.1348,
       "hs_expected_anom_step_frac": 0.3237,
-      "channels": 9
+      "channels": 9,
+      "val_file": "Daphnet_S05R01E1_val.csv",
+      "val_windows_available": 208,
+      "val_anom_windows_available": 141,
+      "val_windows": 200,
+      "val_anom_windows": 133,
+      "val_norm_windows": 67,
+      "val_anom_win_frac": 0.665,
+      "val_anom_step_frac": 0.6154
     },
     "Exathlon": {
       "mode": "file_split",
@@ -114,7 +122,15 @@
       "train_mean_anom_steps_per_anom_window": 60.6,
       "natural_anom_step_frac": 0.1351,
       "hs_expected_anom_step_frac": 0.33,
-      "channels": 20
+      "channels": 20,
+      "val_file": "Exathlon_4_1_100000_61_val.csv",
+      "val_windows_available": 1579,
+      "val_anom_windows_available": 231,
+      "val_windows": 200,
+      "val_anom_windows": 67,
+      "val_norm_windows": 133,
+      "val_anom_win_frac": 0.335,
+      "val_anom_step_frac": 0.335
     },
     "GECCO": {
       "mode": "test_only",
@@ -164,7 +180,15 @@
       "train_mean_anom_steps_per_anom_window": 57.44,
       "natural_anom_step_frac": 0.0098,
       "hs_expected_anom_step_frac": 0.3183,
-      "channels": 16
+      "channels": 16,
+      "val_file": "GHL_41_Lev_corr_Temp_fault_seed_181_vars_23_val.csv",
+      "val_windows_available": 5340,
+      "val_anom_windows_available": 31,
+      "val_windows": 200,
+      "val_anom_windows": 31,
+      "val_norm_windows": 169,
+      "val_anom_win_frac": 0.155,
+      "val_anom_step_frac": 0.1434
     },
     "Genesis": {
       "mode": "test_only",
@@ -230,7 +254,15 @@
       "train_mean_anom_steps_per_anom_window": 47.5,
       "natural_anom_step_frac": 0.0338,
       "hs_expected_anom_step_frac": 0.294,
-      "channels": 20
+      "channels": 20,
+      "val_file": "GutenTAG_0_val.csv",
+      "val_windows_available": 215,
+      "val_anom_windows_available": 7,
+      "val_windows": 200,
+      "val_anom_windows": 7,
+      "val_norm_windows": 193,
+      "val_anom_win_frac": 0.035,
+      "val_anom_step_frac": 0.0169
     },
     "MITDB": {
       "mode": "file_split",
@@ -298,7 +330,15 @@
       "train_mean_anom_steps_per_anom_window": 55.75,
       "natural_anom_step_frac": 0.1049,
       "hs_expected_anom_step_frac": 0.3206,
-      "channels": 2
+      "channels": 2,
+      "val_file": "MITDB_200_val.csv",
+      "val_windows_available": 8090,
+      "val_anom_windows_available": 3422,
+      "val_windows": 200,
+      "val_anom_windows": 67,
+      "val_norm_windows": 133,
+      "val_anom_win_frac": 0.335,
+      "val_anom_step_frac": 0.3115
     },
     "MSL": {
       "mode": "file_split",
@@ -345,7 +385,15 @@
       "train_mean_anom_steps_per_anom_window": 47.65,
       "natural_anom_step_frac": 0.137,
       "hs_expected_anom_step_frac": 0.3071,
-      "channels": 55
+      "channels": 55,
+      "val_file": "MSL_T-13_val.csv",
+      "val_windows_available": 40,
+      "val_anom_windows_available": 10,
+      "val_windows": 40,
+      "val_anom_windows": 10,
+      "val_norm_windows": 30,
+      "val_anom_win_frac": 0.25,
+      "val_anom_step_frac": 0.1578
     },
     "OPPORTUNITY": {
       "mode": "file_split",
@@ -379,7 +427,15 @@
       "train_mean_anom_steps_per_anom_window": 55.32,
       "natural_anom_step_frac": 0.0175,
       "hs_expected_anom_step_frac": 0.315,
-      "channels": 32
+      "channels": 32,
+      "val_file": "OPPORTUNITY_S4-ADL3_val.csv",
+      "val_windows_available": 279,
+      "val_anom_windows_available": 51,
+      "val_windows": 200,
+      "val_anom_windows": 51,
+      "val_norm_windows": 149,
+      "val_anom_win_frac": 0.255,
+      "val_anom_step_frac": 0.2397
     },
     "PSM": {
       "mode": "test_only",
@@ -466,7 +522,15 @@
       "train_mean_anom_steps_per_anom_window": 60.91,
       "natural_anom_step_frac": 0.1485,
       "hs_expected_anom_step_frac": 0.3289,
-      "channels": 25
+      "channels": 25,
+      "val_file": "SMAP_G-7_val.csv",
+      "val_windows_available": 215,
+      "val_anom_windows_available": 10,
+      "val_windows": 200,
+      "val_anom_windows": 10,
+      "val_norm_windows": 190,
+      "val_anom_win_frac": 0.05,
+      "val_anom_step_frac": 0.0316
     },
     "SMD": {
       "mode": "file_split",
@@ -505,7 +569,15 @@
       "train_mean_anom_steps_per_anom_window": 29.42,
       "natural_anom_step_frac": 0.0338,
       "hs_expected_anom_step_frac": 0.2709,
-      "channels": 38
+      "channels": 38,
+      "val_file": "SMD_machine-1-2_val.csv",
+      "val_windows_available": 170,
+      "val_anom_windows_available": 8,
+      "val_windows": 170,
+      "val_anom_windows": 8,
+      "val_norm_windows": 162,
+      "val_anom_win_frac": 0.0471,
+      "val_anom_step_frac": 0.0327
     },
     "SVDB": {
       "mode": "file_split",
@@ -604,7 +676,15 @@
       "train_mean_anom_steps_per_anom_window": 44.0,
       "natural_anom_step_frac": 0.1553,
       "hs_expected_anom_step_frac": 0.3,
-      "channels": 2
+      "channels": 2,
+      "val_file": "SVDB_892_val.csv",
+      "val_windows_available": 2845,
+      "val_anom_windows_available": 2015,
+      "val_windows": 200,
+      "val_anom_windows": 67,
+      "val_norm_windows": 133,
+      "val_anom_win_frac": 0.335,
+      "val_anom_step_frac": 0.2598
     },
     "cicids": {
       "mode": "file_split",
@@ -631,7 +711,15 @@
       "train_mean_anom_steps_per_anom_window": 32.41,
       "natural_anom_step_frac": 0.2701,
       "hs_expected_anom_step_frac": 0.3263,
-      "channels": 72
+      "channels": 72,
+      "val_file": "cicids_0_val.csv",
+      "val_windows_available": 8607,
+      "val_anom_windows_available": 8521,
+      "val_windows": 200,
+      "val_anom_windows": 114,
+      "val_norm_windows": 86,
+      "val_anom_win_frac": 0.57,
+      "val_anom_step_frac": 0.5529
     },
     "creditcard": {
       "mode": "test_only",
@@ -684,7 +772,15 @@
       "train_mean_anom_steps_per_anom_window": 54.55,
       "natural_anom_step_frac": 0.2188,
       "hs_expected_anom_step_frac": 0.322,
-      "channels": 5
+      "channels": 5,
+      "val_file": "room-occupancy_val.csv",
+      "val_windows_available": 66,
+      "val_anom_windows_available": 43,
+      "val_windows": 66,
+      "val_anom_windows": 43,
+      "val_norm_windows": 23,
+      "val_anom_win_frac": 0.6515,
+      "val_anom_step_frac": 0.5104
     },
     "swan": {
       "mode": "test_only",
@@ -715,7 +811,39 @@
     "seed": 42,
     "link_test_from": "../TOTAL_RUN_maskloss_v2/prepared_total",
     "p_anom": 0.3333333333333333,
-    "min_anom_windows": 50
+    "min_anom_windows": 50,
+    "no_val": false,
+    "val_only": false,
+    "val_per_dataset": 200,
+    "val_stride": 16,
+    "val_p_anom": 0.3333333333333333
+  },
+  "val_pool": {
+    "datasets": [
+      "Daphnet",
+      "Exathlon",
+      "GHL",
+      "GutenTAG",
+      "MITDB",
+      "MSL",
+      "OPPORTUNITY",
+      "SMAP",
+      "SMD",
+      "SVDB",
+      "cicids",
+      "room-occupancy"
+    ],
+    "n_datasets": 12,
+    "missing_from_train_pool": [],
+    "per_dataset_budget": 200,
+    "stride": 16,
+    "target_p_anom": 0.3333333333333333,
+    "anomaly_windows": 608,
+    "normal_windows": 1468,
+    "total_windows": 2076,
+    "realized_anom_win_frac": 0.2929,
+    "source": "mTSBench *val.csv (disjoint from the *test.csv train/test split)",
+    "sampling": "hierarchical, without replacement: equal per-dataset budget (level 1) -> p_anom split (level 2) -> n_anom-weighted draw within the anomalous kind (level 3)"
   },
   "train_pool": {
     "datasets": [

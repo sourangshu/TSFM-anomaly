@@ -50,10 +50,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../rajib_work_sp
 WORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                  # .../rajib_work_space (code root)
 
 # Paths
-# PREPARED_DIR must contain per_dataset/<DS>/train_model_inputs.pkl. Built by
-# run_prepare_total.sh in this same folder (uncapped, per-dataset). No val pkl -> NO_VALIDATION=1.
+# PREPARED_DIR must contain per_dataset/<DS>/train_model_inputs.pkl, and — unless
+# NO_VALIDATION=1 — val_model_inputs.pkl. Both are built by run_prepare_total.sh in this
+# same folder (uncapped per-dataset train pools; hierarchically carved val set).
 PREPARED_DIR="${PREPARED_DIR:-${SCRIPT_DIR}/prepared_total}"
-OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-single-stage_mtsbench_maskLossv2_HS_v1}"
+OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-single-stage_mtsbench_maskLossv2_HS_val_v2}"
 
 # Optional third dataset (full path to a .pkl). When set, it is evaluated and
 # logged every eval step exactly like validation (no weight updates), as eval_test_*.
@@ -81,12 +82,15 @@ NUM_STEPS="${NUM_STEPS:-4000}"
 LR="${LR:-1e-5}"                                # blank → script default (1e-5 lora / 1e-6 full)
 BATCH_SIZE="${BATCH_SIZE:-160}"                 # CHANNEL ROWS, not windows
 GRAD_ACCUM="${GRAD_ACCUM:-2}"                   # effective batch = BATCH_SIZE * GRAD_ACCUM
-LOGGING_STEPS="${LOGGING_STEPS:-50}"
-EVAL_STEPS="${EVAL_STEPS:-50}"      # validate + log eval_loss every N steps (must divide 100)
+LOGGING_STEPS="${LOGGING_STEPS:-100}"
+EVAL_STEPS="${EVAL_STEPS:-100}"      # validate + log eval_loss every N steps (must divide 100)
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 FP16="${FP16:-1}"                               # 1 = fp16 mixed precision, 0 = disable
-NO_VALIDATION="${NO_VALIDATION:-1}"             # 1 = disable validation (no val pkl is written)
+# 0 = validate on PREPARED_DIR/val_model_inputs.pkl (hierarchical: an equal window budget
+# from every trained dataset's mTSBench *val.csv, ~1/3 anomalous where the file allows).
+# Set to 1 only when the prep ran with NO_VAL=1 and no val pkl exists.
+NO_VALIDATION="${NO_VALIDATION:-0}"
 DEBUG="${DEBUG:-0}"                             # 1 = truncate to 50 windows PER DATASET (smoke test)
 
 # Margin (hinge) loss: L_good + MARGIN_LAMBDA * L_bad_term.
@@ -166,6 +170,15 @@ if [ ! -d "${PREPARED_DIR}/per_dataset" ]; then
     echo "ERROR: ${PREPARED_DIR}/per_dataset not found."
     echo "       The hierarchical sampler needs the per-dataset train pool."
     echo "       Run ./run_prepare_total.sh first."
+    exit 1
+fi
+
+if [ "${NO_VALIDATION}" != "1" ] && [ ! -f "${PREPARED_DIR}/val_model_inputs.pkl" ]; then
+    echo "ERROR: ${PREPARED_DIR}/val_model_inputs.pkl not found, but NO_VALIDATION=0."
+    echo "       Add the val set WITHOUT re-carving train/test (safe on prepared data"
+    echo "       a run is already reading):"
+    echo "           VAL_ONLY=1 ./run_prepare_total.sh"
+    echo "       Or train without validation:  NO_VALIDATION=1 ./run_finetune_total.sh"
     exit 1
 fi
 

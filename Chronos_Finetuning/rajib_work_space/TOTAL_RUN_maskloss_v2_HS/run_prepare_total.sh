@@ -47,6 +47,17 @@ LINK_TEST_FROM="${LINK_TEST_FROM-../TOTAL_RUN_maskloss_v2/prepared_total}"
 P_ANOM="${P_ANOM:-0.3333333333333333}"
 MIN_ANOM_WINDOWS="${MIN_ANOM_WINDOWS:-50}"   # warn below this; hard-fail only at zero
 
+# Validation set — carved from mTSBench's own *val.csv (one per dataset, disjoint from
+# the *test.csv files split into our train/test halves), HIERARCHICALLY: an equal budget
+# for every trained dataset (level 1), split VAL_P_ANOM / 1-VAL_P_ANOM across anomalous
+# and normal kinds (level 2), n_anom-weighted inside the anomalous kind (level 3).
+# Fixed seed -> a deterministic val_model_inputs.pkl. NO_VAL=1 restores the old behaviour.
+# VAL_ONLY=1 adds the val set to an existing prepared_total without re-carving train/test.
+NO_VAL="${NO_VAL:-0}"
+VAL_PER_DATASET="${VAL_PER_DATASET:-200}"    # windows per dataset; short files give all they have
+VAL_STRIDE="${VAL_STRIDE:-16}"               # < STRIDE: the small val files can't fill 200 at 64
+VAL_P_ANOM="${VAL_P_ANOM:-0.3333333333333333}"   # match P_ANOM: eval the mix we train on
+
 echo "Data root         : ${DATA_ROOT}"
 echo "Output dir        : ${OUTPUT_DIR}"
 echo "Test fraction     : ${TEST_FRACTION}  (file-based, per dataset)"
@@ -55,7 +66,12 @@ echo "Stride train/test : ${STRIDE} / ${TEST_STRIDE}"
 echo "Cap / threshold   : NONE / NONE  (every train window kept)"
 echo "Balancing         : none at prep — dataset AND class balance are the HS sampler's job"
 echo "Test halves       : ${LINK_TEST_FROM:-carved here}"
-echo "Val probe         : none (run finetune with NO_VALIDATION=1; EVAL_TEST stays manual)"
+if [ "${NO_VAL}" = "1" ]; then
+echo "Val set           : none (run finetune with NO_VALIDATION=1; EVAL_TEST stays manual)"
+else
+echo "Val set           : mTSBench *val.csv, hierarchical — ${VAL_PER_DATASET} windows/dataset"
+echo "                    (stride ${VAL_STRIDE}, target anomalous share ${VAL_P_ANOM})"
+fi
 echo
 
 ARGS=(
@@ -70,7 +86,12 @@ ARGS=(
     --seed                "${SEED}"
     --p_anom              "${P_ANOM}"
     --min_anom_windows    "${MIN_ANOM_WINDOWS}"
+    --val_per_dataset     "${VAL_PER_DATASET}"
+    --val_stride          "${VAL_STRIDE}"
+    --val_p_anom          "${VAL_P_ANOM}"
 )
+[ "${NO_VAL}" = "1" ] && ARGS+=(--no_val)
+[ "${VAL_ONLY:-0}" = "1" ] && ARGS+=(--val_only)
 [ -n "${LINK_TEST_FROM}" ] && ARGS+=(--link_test_from "${LINK_TEST_FROM}")
 [ -n "${DATASETS:-}" ] && ARGS+=(--datasets ${DATASETS})
 
@@ -79,3 +100,5 @@ python -u prepare_total.py "${ARGS[@]}"
 echo
 echo "Done. Per-dataset train -> ${OUTPUT_DIR}/per_dataset/<DATASET>/train_model_inputs.pkl"
 echo "      Per-dataset test  -> ${OUTPUT_DIR}/per_dataset/<DATASET>/test_model_inputs.pkl"
+[ "${NO_VAL}" = "1" ] || \
+echo "      Val set           -> ${OUTPUT_DIR}/val_model_inputs.pkl   (finetune: NO_VALIDATION=0)"
