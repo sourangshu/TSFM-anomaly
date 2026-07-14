@@ -17,6 +17,8 @@
 #   level 2  kind    ~ Bernoulli(P_ANOM)          → 2:1 normal:anomalous in expectation
 #   level 3  window  ~ count-weighted WITHIN that dataset, by n_anom (anomalous kind)
 #                      or 64 - n_anom (normal kind)
+#
+# ...plus an OPTIONAL level 1.5 (FILE), off by default — see FILE_DIVERSITY_DATASETS below.
 # Both level-3 branches are thresholdless: the anomalous branch is self-gating (a
 # pure-normal window has weight 0), and the normal branch merely down-weights an
 # anomaly-bearing window rather than excluding it. No `future_labels.sum() >= 10`
@@ -37,6 +39,8 @@
 #   P_ANOM=0.5 bash run_finetune_total.sh                    # 1:1 normal:anomalous kinds
 #   BATCH_SIZE=80 GRAD_ACCUM=4 bash run_finetune_total.sh    # tighter memory budget
 #   DEBUG=1 bash run_finetune_total.sh                       # 50 windows PER DATASET, smoke test
+#   FILE_DIVERSITY_DATASETS="MITDB SVDB" bash run_finetune_total.sh   # + level 1.5 on those two
+#   FILE_DIVERSITY_DATASETS=all bash run_finetune_total.sh            # + level 1.5 everywhere
 
 set -euo pipefail
 
@@ -49,12 +53,69 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../rajib_work_space/TOTAL_RUN_maskloss_v2_HS
 WORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                  # .../rajib_work_space (code root)
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  ►►►  EXPERIMENT SELECTOR — pick ONE block. Uncomment it, comment the others. ◄◄◄
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Each block sets BOTH knobs that define the run:
+#   FILE_DIVERSITY_DATASETS  which datasets get the sampler's level 1.5 (the file draw)
+#   EXP_TAG                  names the checkpoint dir, so two runs can never overwrite
+#                            each other and forward.py can tell them apart
+#
+# Everything else (P_ANOM, loss, LoRA, steps) is identical across the blocks — that is
+# what makes these a clean ablation of the file level and nothing else.
+#
+# Level 1.5 recap: after the dataset is drawn uniformly, ONE of its source *test.csv
+# files is drawn from that file's dissimilarity weight, and only then the kind and the
+# window. Files that are near-duplicates of each other are down-weighted, unusual ones
+# promoted, so the dataset's budget is spent across its distinct PATTERNS rather than
+# across its raw minutes of recording. Datasets NOT listed keep the exact 3-level path.
+
+# ── EXP A: baseline — no file level anywhere (the current, unchanged sampler) ──
+# FILE_DIVERSITY_DATASETS="${FILE_DIVERSITY_DATASETS:-}"
+# EXP_TAG="${EXP_TAG:-base}"
+
+# ── EXP B: file level on MSL ONLY ─────────────────────────────────────────────
+# The single-dataset probe. Every other dataset keeps the plain 3-level path, so any
+# change in MSL's forward number is attributable to the file level alone.
+FILE_DIVERSITY_DATASETS="${FILE_DIVERSITY_DATASETS:-MSL}"
+EXP_TAG="${EXP_TAG:-fdiv_MSL}"
+
+# ── EXP C: file level on EVERY multi-file dataset ─────────────────────────────
+# 'all' resolves at load time to every dataset in the train pool that has >1 train file
+# (single-file datasets are skipped automatically — the file level is a no-op there).
+# FILE_DIVERSITY_DATASETS="${FILE_DIVERSITY_DATASETS:-all}"
+# EXP_TAG="${EXP_TAG:-fdiv_all}"
+
+# ── (optional) EXP D: your own subset ─────────────────────────────────────────
+# FILE_DIVERSITY_DATASETS="${FILE_DIVERSITY_DATASETS:-MITDB SVDB Exathlon Daphnet SMAP GutenTAG}"
+# EXP_TAG="${EXP_TAG:-fdiv_manyfile}"
+
+# Fallback when every block above is commented out: the unchanged 3-level baseline.
+# (Also what makes `set -u` safe here, and what lets an exported env var win over the
+#  block you left uncommented — the :- form above only fills in when the var is unset.)
+# FILE_DIVERSITY_DATASETS="${FILE_DIVERSITY_DATASETS:-}"
+# EXP_TAG="${EXP_TAG:-base}"
+
+# ═════════════════════════════════════════════════════════════════════════════
+
 # Paths
 # PREPARED_DIR must contain per_dataset/<DS>/train_model_inputs.pkl, and — unless
 # NO_VALIDATION=1 — val_model_inputs.pkl. Both are built by run_prepare_total.sh in this
 # same folder (uncapped per-dataset train pools; hierarchically carved val set).
+#
+# It must ALSO contain per_dataset/<DS>/{train_file_index.npy,train_files.json} for any
+# dataset named in FILE_DIVERSITY_DATASETS above — those are the per-file weights, and a
+# prepared dir carved before they existed will make the sampler fall back to 3 levels
+# (with a loud warning). Re-run run_prepare_total.sh if you see that.
+#
+# Point this at the syn-data prep if you want the 7 one-file datasets in the train pool:
+#   PREPARED_DIR="${SCRIPT_DIR}/prepared_total_syn"
 PREPARED_DIR="${PREPARED_DIR:-${SCRIPT_DIR}/prepared_total}"
-OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-single-stage_mtsbench_maskLossv2_HS_val_v2}"
+
+# Checkpoint dir, tagged by EXP_TAG so the runs above never collide. Override by exporting
+# OUTPUT_DIR if you want somewhere else entirely.
+OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/chronos2-HS_${EXP_TAG}}"
 
 # Optional third dataset (full path to a .pkl). When set, it is evaluated and
 # logged every eval step exactly like validation (no weight updates), as eval_test_*.
@@ -90,7 +151,7 @@ FP16="${FP16:-1}"                               # 1 = fp16 mixed precision, 0 = 
 # 0 = validate on PREPARED_DIR/val_model_inputs.pkl (hierarchical: an equal window budget
 # from every trained dataset's mTSBench *val.csv, ~1/3 anomalous where the file allows).
 # Set to 1 only when the prep ran with NO_VAL=1 and no val pkl exists.
-NO_VALIDATION="${NO_VALIDATION:-0}"
+NO_VALIDATION="${NO_VALIDATION:-1}"
 DEBUG="${DEBUG:-0}"                             # 1 = truncate to 50 windows PER DATASET (smoke test)
 
 # Margin (hinge) loss: L_good + MARGIN_LAMBDA * L_bad_term.
@@ -121,6 +182,39 @@ MARGIN_LAMBDA="${MARGIN_LAMBDA:-1.0}"
 # (room-occupancy, 18.9%) alike: both land at ~30-33% anomaly steps per batch.
 # Level 1 (dataset) is uniform and has no knob — every dataset gets 1/K of the draws.
 P_ANOM="${P_ANOM:-0.3333333333333333}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Level 1.5 — the OPTIONAL FILE level  (default: off)
+# ─────────────────────────────────────────────────────────────────────────────
+# Names the datasets whose draws should pass through a FILE level between the dataset
+# draw and the kind draw:
+#
+#   level 1    dataset ~ Uniform(K)
+#   level 1.5  file    ~ Categorical(w_f)      <- only for the datasets named here
+#   level 2    kind    ~ Bernoulli(P_ANOM)
+#   level 3    window  ~ count-weighted within (dataset, file, kind)
+#
+# WHY. A dataset's train windows are pooled from many *test.csv files, and level 3's count
+# weighting cannot see which file a window came from. So a dataset's budget is spent in
+# proportion to raw MINUTES of recording: SVDB's 39 ECG records are largely near duplicates
+# of one another, and the longest of them supply most of the draws while a short, unusual
+# recording is effectively never trained on. Drawing the file FIRST spends the budget across
+# the dataset's distinct PATTERNS instead.
+#
+# The weights w_f come from run_prepare_total.sh (per_dataset/<DS>/train_files.json): an
+# inverse kernel density over a 22-number per-file signature, so a file sitting in a tight
+# cluster of near-duplicates is down-weighted and a lone unusual file is promoted. Tune them
+# there with FILE_WEIGHT_ALPHA (0 = plain uniform-over-files, the ablation baseline) and
+# FILE_WEIGHT_CAP — no re-prep of the windows is needed to flip THIS flag, only to change
+# the weights.
+#
+# Values: "" / "none" (every dataset keeps the exact 3-level path), "all", or a
+# space-separated list. Datasets not named are untouched, which is what keeps a file-level
+# run a one-variable ablation against the 3-level one.
+#
+# ►► SET THIS IN THE EXPERIMENT SELECTOR AT THE TOP OF THIS FILE. ◄◄
+# It is already assigned by the time we get here. An exported env var still wins, e.g.
+#   FILE_DIVERSITY_DATASETS="MITDB SVDB" EXP_TAG=oneoff bash run_finetune_total.sh
 
 # Per-step masked-loss aggregation:
 #   batch_global -> pool all steps in the batch (each step weighted equally; most
@@ -189,6 +283,7 @@ fi
 echo "======================================================"
 echo "  Chronos-2 Single-Stage Anomaly Fine-Tuning  [HS]"
 echo "======================================================"
+echo "  EXPERIMENT        = $EXP_TAG"
 echo "  PREPARED_DIR      = $PREPARED_DIR"
 echo "  OUTPUT_DIR        = $OUTPUT_DIR"
 echo "  MODEL_ID          = $MODEL_ID"
@@ -213,6 +308,7 @@ echo "  MARGIN_M          = $MARGIN_M  (relative-margin multiplier; MARGIN_MODE=
 echo "  MARGIN_TAU        = $MARGIN_TAU  (absolute margin; MARGIN_MODE=absolute)"
 echo "  MARGIN_LAMBDA     = $MARGIN_LAMBDA"
 echo "  P_ANOM            = $P_ANOM  (HS level 2: P(anomalous kind); level 1 = uniform datasets)"
+echo "  FILE_DIVERSITY    = ${FILE_DIVERSITY_DATASETS:-none}  (HS level 1.5: dissimilarity-weighted file draw)"
 echo "  AGG_MODE          = $AGG_MODE  (per-step masked loss aggregation)"
 if [ "$FINETUNE_MODE" = "lora" ]; then
 echo "------------------------------------------------------"
@@ -269,6 +365,11 @@ FINETUNE_ARGS=(
 
 # Learning rate — omit entirely to use the script's built-in default
 [ -n "${LR}" ] && FINETUNE_ARGS+=(--lr "$LR")
+
+# Level 1.5 — unquoted on purpose: the value is a space-separated dataset list (nargs="*").
+# Omitted entirely when empty, so the sampler stays exactly 3-level by default.
+[ -n "${FILE_DIVERSITY_DATASETS}" ] && \
+    FINETUNE_ARGS+=(--file_diversity_datasets ${FILE_DIVERSITY_DATASETS})
 
 # Optional third (test) dataset — evaluated like validation, logged as eval_test_*
 [ -n "${TEST_DATA}" ] && FINETUNE_ARGS+=(--test_data "$TEST_DATA")

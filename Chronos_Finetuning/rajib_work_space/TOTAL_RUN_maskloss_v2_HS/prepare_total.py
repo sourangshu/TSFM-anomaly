@@ -52,21 +52,65 @@ key that would have to be smuggled past Chronos2Dataset's input validation.
 It also caps prep-time RAM at one dataset (MITDB, ~1.2 GB) instead of the whole
 6.9 GB pool, and makes prep resumable and subsettable.
 
+SYNTHETIC DATA  (--use_syn_data, OFF by default)
+------------------------------------------------
+Seven datasets (CalIt2, creditcard, GECCO, Genesis, metro, PSM, swan) ship exactly
+one *test.csv, so the 50/50 file split has nothing to split: they are TEST-ONLY and
+invisible to level 1. Synthetic files generated for them live in
+
+    <DATA_ROOT>/<DATASET>/syn_data/*test.csv
+
+With --use_syn_data those files are appended to the dataset's TRAIN half and NOWHERE
+else. They never enter the test half (evaluation must stay real) and never enter the
+val set (that comes from mTSBench's own *val.csv). The real *test.csv of a one-file
+dataset therefore remains its complete, unchanged test half — so --link_test_from
+still holds and forward.py's numbers stay comparable — while the dataset joins the
+train pool and level 1 grows from 12 to 19 groups.
+
+Real files are discovered at the dataset's TOP LEVEL only (<DATASET>/*test.csv), not
+recursively. This is deliberate: a recursive glob also swept up Exathlon/data_not_used/,
+three byte-identical copies of real Exathlon files that are not part of upstream
+mTSBench (PLAN-Lab/mTSBench has no such folder). One of them, Exathlon_1_5_1000000_86,
+landed in the train half AND the test half at once. Top-level discovery drops the
+folder, which changes Exathlon's seeded file split — _link_or_build_test() detects
+that against the source manifest and re-carves Exathlon rather than linking a stale
+test half.
+
+FILE-LEVEL DIVERSITY WEIGHTS
+----------------------------
+A dataset's train windows are pooled from many *test.csv files that are often near
+duplicates (SVDB: 39 ECG records; MITDB: 23), and level 3's count weighting is blind
+to which file a window came from — so the longest files dominate and a rare, unusual
+recording is drowned out. This prep therefore also emits, per dataset, the file each
+window came from plus a per-file DISSIMILARITY weight, so that the sampler can insert
+an optional file level between levels 1 and 2 (see --file_diversity_datasets in
+finetune_anomaly_simple.py). Weights come from an inverse kernel density over a
+robust per-file signature: a file sitting in a tight cluster of near-duplicates is
+down-weighted, a lone unusual file is up-weighted. Computing them here (rather than
+at train time) costs no extra I/O and lets the sampler flag be flipped without a
+re-prep.
+
 Products:
   1. per_dataset/<DATASET>/train_model_inputs.pkl   (UNCAPPED train half)
      per_dataset/<DATASET>/train_n_anom.npy         (int16 (N,) sidecar: anomaly
          steps per window — lets the sampler's expected balance be audited
          without loading 6.9 GB of windows)
+     per_dataset/<DATASET>/train_file_index.npy     (int32 (N,) sidecar: which
+         source file each window came from, indexing train_files.json's "files")
+     per_dataset/<DATASET>/train_files.json         (file names, per-file window /
+         anomaly counts, dissimilarity weights, effective sample size)
   2. per_dataset/<DATASET>/{test_model_inputs.pkl, test_series_meta.pkl}
      (TEST half, UNCAPPED — evaluation must see every test window)
   3. manifest.json
 
-Datasets with exactly one *test.csv are TEST-ONLY: they contribute no train
-windows, so they are absent from the train pool and invisible to level 1.
+Datasets with exactly one *test.csv and no usable syn_data are TEST-ONLY: they
+contribute no train windows, so they are absent from the train pool and invisible
+to level 1.
 
 Usage
 -----
     python prepare_total.py                                  # carve everything
+    python prepare_total.py --use_syn_data                   # + syn_data into TRAIN only
     python prepare_total.py --link_test_from ../TOTAL_RUN_maskloss_v2/prepared_total
                                                              # reuse existing test pkls
     python prepare_total.py --datasets SMD MSL SMAP          # subset
@@ -100,8 +144,29 @@ logger = logging.getLogger("prepare_total")
 #  Per-dataset file discovery + 50/50 file-based split  (verbatim from v2)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def real_test_csvs(ddir: str):
+    """The dataset's real *test.csv files — TOP LEVEL ONLY, never recursive.
+
+    Non-recursive on purpose. A recursive glob also picks up stray sub-directories
+    that are not part of upstream mTSBench (Exathlon/data_not_used/ held byte-identical
+    copies of three real files, one of which then sat in the train half and the test
+    half simultaneously), and it would sweep syn_data/ in as if it were real data.
+    Synthetic files are discovered separately by syn_test_csvs() and are TRAIN-ONLY."""
+    return sorted(glob.glob(os.path.join(ddir, "*test.csv")))
+
+
+def syn_test_csvs(ddir: str, syn_dir: str):
+    """The dataset's SYNTHETIC *test.csv files, or [] when it has none.
+
+    These exist for the datasets that ship a single real *test.csv and would otherwise
+    be test-only. They are appended to the TRAIN half and go nowhere else: never the
+    test half (evaluation stays real), never the val set (that is the dataset's own
+    *val.csv)."""
+    return sorted(glob.glob(os.path.join(ddir, syn_dir, "*test.csv")))
+
+
 def list_datasets(data_root: str, only):
-    """Dataset = any sub-directory of data_root containing >=1 *test.csv file."""
+    """Dataset = any sub-directory of data_root containing >=1 real *test.csv file."""
     names = []
     for entry in sorted(os.listdir(data_root)):
         d = os.path.join(data_root, entry)
@@ -109,7 +174,7 @@ def list_datasets(data_root: str, only):
             continue
         if only and entry not in only:
             continue
-        if glob.glob(os.path.join(d, "**", "*test.csv"), recursive=True):
+        if real_test_csvs(d):
             names.append(entry)
     return names
 
@@ -163,16 +228,199 @@ def hs_expected_anom_step_frac(n_anom: np.ndarray, H: int, p_anom: float):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Per-file dissimilarity weights (the sampler's optional file level)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Goal: inside one dataset, stop near-duplicate files from dominating and give the
+# unusual ones a real chance of being drawn, so training sees the dataset's whole
+# repertoire of patterns rather than its most common one repeated.
+#
+#   1. signature   a fixed-length, channel-count-agnostic descriptor per file
+#   2. standardize robustly across the dataset's files (median / IQR)
+#   3. density     s_f = sum over the OTHER files of a Gaussian kernel on the
+#                  pairwise distance, bandwidth = median pairwise distance
+#   4. weight      w_f  ∝ (1 + s_f)^(-alpha)
+#
+# Inverse DENSITY, not mean distance: with mean distance a single far-flung outlier
+# collects most of the mass and the rest stay uniform, which is not what we want. With
+# inverse density every member of a tight cluster is discounted (they explain each
+# other) while an isolated file — however mildly isolated — is promoted. alpha=0 gives
+# uniform-over-files (already a large change from level 3's count weighting, which is
+# dominated by the longest files) and is the natural ablation baseline.
+
+_FEAT_NAMES = ("mean", "std", "skew", "kurtosis", "acf1", "acf10", "acf50",
+               "roughness", "spectral_entropy")
+
+
+def _channel_signature(x: np.ndarray) -> np.ndarray:
+    """9 shape descriptors for ONE channel (a 1-D float array)."""
+    x = x[np.isfinite(x)]
+    if x.size < 8:
+        return np.zeros(len(_FEAT_NAMES), dtype=np.float64)
+    mu, sd = float(x.mean()), float(x.std())
+    z = (x - mu) / sd if sd > 1e-12 else np.zeros_like(x)   # shape stats are scale-free
+    skew = float((z ** 3).mean())
+    kurt = float((z ** 4).mean()) - 3.0
+    acfs = []
+    for lag in (1, 10, 50):
+        if z.size > lag + 1:
+            a, b = z[:-lag], z[lag:]
+            denom = float(np.sqrt((a * a).mean() * (b * b).mean()))
+            acfs.append(float((a * b).mean() / denom) if denom > 1e-12 else 0.0)
+        else:
+            acfs.append(0.0)
+    roughness = float(np.abs(np.diff(z)).mean()) if z.size > 1 else 0.0
+    # Spectral entropy of the normalized power spectrum: low = one dominant periodicity,
+    # high = broadband/noisy. Separates e.g. a clean ECG from a bursty server metric.
+    p = np.abs(np.fft.rfft(z - z.mean())) ** 2
+    tot = p.sum()
+    if tot > 1e-12 and p.size > 1:
+        p = p / tot
+        nz = p[p > 0]
+        spec_ent = float(-(nz * np.log(nz)).sum() / np.log(p.size))
+    else:
+        spec_ent = 0.0
+    return np.array([mu, sd, skew, kurt, *acfs, roughness, spec_ent], dtype=np.float64)
+
+
+def file_signature(sig: np.ndarray, labels: np.ndarray, n_windows: int) -> np.ndarray:
+    """One file -> a fixed-length descriptor, independent of its channel count.
+
+    `sig` is (F, T) — the file's signal, `labels` its (T,) per-step 0/1 ground truth.
+    Per-channel descriptors are pooled by mean AND std across channels (the std says
+    how heterogeneous the channels are, which itself distinguishes files), then the
+    file's anomaly profile is appended: anomalies are a pattern to be sampled too, so
+    two files with identical dynamics but different anomaly regimes must not collapse
+    onto the same point."""
+    per_ch = np.stack([_channel_signature(sig[c]) for c in range(sig.shape[0])])  # (F, 9)
+    pooled = np.concatenate([per_ch.mean(axis=0), per_ch.std(axis=0)])            # (18,)
+
+    lab = np.asarray(labels, dtype=np.int8).ravel()
+    rate = float(lab.mean()) if lab.size else 0.0
+    d = np.diff(np.concatenate([[0], lab, [0]]))
+    starts, ends = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
+    n_seg = len(starts)
+    seg_len = float((ends - starts).mean()) if n_seg else 0.0
+    seg_rate = 1000.0 * n_seg / max(lab.size, 1)          # segments per 1000 steps
+    anom = np.array([rate, seg_rate, np.log1p(seg_len), np.log1p(n_windows)])
+    return np.concatenate([pooled, anom])                                          # (22,)
+
+
+def dissimilarity_weights(feats: np.ndarray, alpha: float, cap: float):
+    """Per-file sampling weights from an inverse kernel density. Returns (w, ess).
+
+    `feats` is (n_files, D). Weights sum to 1. `cap` bounds any file at cap x (and
+    1/cap x) the uniform weight 1/n, so one weird file can never eat the dataset."""
+    n = len(feats)
+    if n <= 1:
+        return np.ones(max(n, 1), dtype=np.float64) / max(n, 1), float(n)
+
+    # Robust standardization: median/IQR, not mean/std — a single extreme file must not
+    # define the scale of the axis it is extreme on. Constant features get zero spread
+    # and are dropped (they carry no information about which files differ).
+    med = np.median(feats, axis=0)
+    q75, q25 = np.percentile(feats, 75, axis=0), np.percentile(feats, 25, axis=0)
+    iqr = q75 - q25
+    keep = iqr > 1e-9
+    if not keep.any():                       # every file identical under the signature
+        return np.ones(n) / n, float(n)
+    z = (feats[:, keep] - med[keep]) / iqr[keep]
+    z = np.clip(z, -5.0, 5.0)                # a lone outlier informs, it does not dictate
+
+    d2 = np.maximum(((z[:, None, :] - z[None, :, :]) ** 2).sum(-1), 0.0)
+    off = d2[~np.eye(n, dtype=bool)]
+    sigma2 = float(np.median(off[off > 0])) if (off > 0).any() else 1.0
+    if sigma2 <= 1e-12:
+        sigma2 = 1.0
+
+    kern = np.exp(-d2 / (2.0 * sigma2))
+    np.fill_diagonal(kern, 0.0)
+    density = kern.sum(axis=1)               # how much "company" each file keeps
+
+    w = (1.0 + density) ** (-float(alpha))
+    w = w / w.sum()
+
+    if cap and cap > 1.0:
+        lo, hi = 1.0 / (cap * n), cap / n
+        for _ in range(50):                  # clip + renormalize until it settles
+            w_new = np.clip(w, lo, hi)
+            w_new = w_new / w_new.sum()
+            if np.allclose(w_new, w, atol=1e-9):
+                w = w_new
+                break
+            w = w_new
+
+    ess = float(1.0 / (w ** 2).sum())        # 1 = one file owns everything, n = uniform
+    return w, ess
+
+
+def build_file_weights(train_inputs, file_index, file_names, args):
+    """Signature + weight every train file of one dataset. Returns a JSON-able dict.
+
+    The per-file signal is reconstructed from the windows already in memory — the train
+    stride equals the prediction length, so consecutive windows' `future` blocks tile the
+    series contiguously and concatenating them replays it (minus the leading context).
+    No CSV is re-read. Long files are subsampled to `--file_feat_max_windows` evenly
+    spaced windows, which is plenty for a 22-number descriptor."""
+    H = args.prediction_length
+    feats, per_file = [], []
+    for f, name in enumerate(file_names):
+        idx = np.flatnonzero(file_index == f)
+        if idx.size == 0:                    # file yielded no window (too short)
+            feats.append(np.zeros(22))
+            per_file.append({"file": name, "windows": 0, "anom_windows": 0})
+            continue
+        take = idx
+        if idx.size > args.file_feat_max_windows:
+            take = idx[np.linspace(0, idx.size - 1, args.file_feat_max_windows).astype(int)]
+        sig = np.concatenate([np.asarray(train_inputs[i]["target"])[:, -H:] for i in take],
+                             axis=1).astype(np.float64)
+        lab = np.concatenate([np.asarray(train_inputs[i]["future_labels"]) for i in take])
+        feats.append(file_signature(sig, lab, n_windows=int(idx.size)))
+        n_a = sum(1 for i in idx if int(np.asarray(train_inputs[i]["future_labels"]).sum()) >= 1)
+        per_file.append({"file": name, "windows": int(idx.size), "anom_windows": int(n_a)})
+
+    w, ess = dissimilarity_weights(np.stack(feats), args.file_weight_alpha,
+                                   args.file_weight_cap)
+
+    # A file with no windows cannot be drawn; hand its mass back to the others.
+    live = np.array([e["windows"] > 0 for e in per_file])
+    if live.any() and not live.all():
+        w = np.where(live, w, 0.0)
+        w = w / w.sum()
+        ess = float(1.0 / (w[w > 0] ** 2).sum())
+
+    for e, wi in zip(per_file, w):
+        e["weight"] = round(float(wi), 6)
+    return {
+        "files": list(file_names),
+        "weights": [float(x) for x in w],
+        "per_file": per_file,
+        "n_files": len(file_names),
+        "ess": round(ess, 2),
+        "alpha": args.file_weight_alpha,
+        "cap": args.file_weight_cap,
+        "method": "inverse kernel density over a robust 22-d per-file signature",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _link_or_build_test(ds, ds_out, test_files, args, min_req, src_manifest):
     """Symlink the TEST pkls from an existing prepared_total, or carve them.
 
-    Linking is safe because the test half is a pure function of (test_files,
-    context_length, prediction_length, test_stride, min_length) and the file split
-    is seeded identically — the bytes are the same. Linking guarantees, rather than
-    merely asserts, that every arm evaluates on identical windows."""
+    Linking is safe ONLY while the test half is a pure function of (test_files,
+    context_length, prediction_length, test_stride, min_length) and the file split is
+    seeded identically — then the bytes are the same, and linking guarantees rather
+    than merely asserts that every arm evaluates on identical windows.
+
+    That premise is now checkable and can fail: dropping Exathlon/data_not_used/ from
+    discovery shrinks Exathlon from 33 files to 30, which re-seeds its permutation and
+    moves its test half. So compare our test_files against the source manifest's and
+    CARVE instead of linking whenever they disagree — silently linking a test half that
+    belongs to a different file split is the one failure this whole scheme must not have."""
     test_pkl = os.path.join(ds_out, "test_model_inputs.pkl")
     meta_pkl = os.path.join(ds_out, "test_series_meta.pkl")
 
@@ -185,23 +433,20 @@ def _link_or_build_test(ds, ds_out, test_files, args, min_req, src_manifest):
                 f"--link_test_from given but {src_test} is missing. Either point it at a "
                 f"complete prepared_total, or drop the flag to carve the test half here."
             )
-        for dst, s in ((test_pkl, src_test), (meta_pkl, src_meta)):
-            if os.path.islink(dst) or os.path.exists(dst):
-                os.remove(dst)
-            os.symlink(s, dst)
-        stats = (src_manifest.get("datasets", {}) or {}).get(ds, {})
-        n_win, n_series, n_anom = (stats.get("test_windows"), stats.get("test_series"),
-                                   stats.get("test_anomalous"))
-        if n_win is None:               # source manifest incomplete -> count for real
-            with open(src_test, "rb") as f:
-                ti = pickle.load(f)
-            with open(src_meta, "rb") as f:
-                tm = pickle.load(f)
-            n_win, n_series = len(ti), len(tm)
-            n_anom = int((anomaly_step_counts(ti) >= 1).sum())
-        logger.info(f"  TEST  -> LINKED {n_win} windows ({n_series} series), "
-                    f"{n_anom} anomalous <- {src}")
-        return n_win, n_series, n_anom
+        stats_chk = (src_manifest.get("datasets", {}) or {}).get(ds, {})
+        src_files = stats_chk.get("test_files")
+        ours = [os.path.basename(f) for f in test_files]
+        if src_files is not None and sorted(src_files) != sorted(ours):
+            logger.warning(
+                f"  [{ds}] test-half file split DIFFERS from {args.link_test_from} "
+                f"({len(src_files)} files there vs {len(ours)} here) — NOT linking; "
+                f"carving it fresh. Its forward.py numbers are not comparable with the "
+                f"arms that used the old split."
+            )
+            logger.warning(f"           there: {sorted(src_files)}")
+            logger.warning(f"           here : {sorted(ours)}")
+        else:
+            return _link_test(src, test_pkl, meta_pkl, src_test, src_meta, stats_chk)
 
     test_pairs, _, _, test_meta = build_pairs_for_files(
         test_files, args.context_length, args.prediction_length,
@@ -215,6 +460,26 @@ def _link_or_build_test(ds, ds_out, test_files, args, min_req, src_manifest):
     logger.info(f"  TEST  -> {len(test_inputs)} windows ({len(test_meta)} series), "
                 f"{n_anom} anomalous -> {ds_out}  [UNCAPPED]")
     return len(test_inputs), len(test_meta), n_anom
+
+
+def _link_test(src, test_pkl, meta_pkl, src_test, src_meta, stats):
+    """Symlink one dataset's TEST pkls from a source prep whose file split we matched."""
+    for dst, s in ((test_pkl, src_test), (meta_pkl, src_meta)):
+        if os.path.islink(dst) or os.path.exists(dst):
+            os.remove(dst)
+        os.symlink(s, dst)
+    n_win, n_series, n_anom = (stats.get("test_windows"), stats.get("test_series"),
+                               stats.get("test_anomalous"))
+    if n_win is None:                   # source manifest incomplete -> count for real
+        with open(src_test, "rb") as f:
+            ti = pickle.load(f)
+        with open(src_meta, "rb") as f:
+            tm = pickle.load(f)
+        n_win, n_series = len(ti), len(tm)
+        n_anom = int((anomaly_step_counts(ti) >= 1).sum())
+    logger.info(f"  TEST  -> LINKED {n_win} windows ({n_series} series), "
+                f"{n_anom} anomalous <- {src}")
+    return n_win, n_series, n_anom
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -452,12 +717,22 @@ def prepare(args) -> None:
 
     for ds in datasets:
         ddir = os.path.join(args.data_root, ds)
-        test_csvs = sorted(glob.glob(os.path.join(ddir, "**", "*test.csv"), recursive=True))
+        test_csvs = real_test_csvs(ddir)
         train_files, test_files, mode = split_files(test_csvs, args.test_fraction, args.seed)
 
+        # Synthetic files join the TRAIN half and nothing else. The real *test.csv of a
+        # one-file dataset therefore stays its whole, unchanged test half (so the link
+        # and forward.py stay valid) while the dataset finally becomes trainable.
+        syn_files = syn_test_csvs(ddir, args.syn_dir) if args.use_syn_data else []
+        if syn_files:
+            train_files = list(train_files) + syn_files
+            mode = f"{mode}+syn"
+
         logger.info("=" * 78)
-        logger.info(f"{ds}: {len(test_csvs)} *test.csv  [{mode}]  "
-                    f"train_files={len(train_files)} test_files={len(test_files)}")
+        logger.info(f"{ds}: {len(test_csvs)} real *test.csv"
+                    + (f" + {len(syn_files)} synthetic" if syn_files else "")
+                    + f"  [{mode}]  train_files={len(train_files)} "
+                      f"test_files={len(test_files)}")
 
         ds_out = os.path.join(per_ds_root, ds)
         os.makedirs(ds_out, exist_ok=True)
@@ -470,6 +745,8 @@ def prepare(args) -> None:
         entry = {
             "mode": mode,
             "n_test_csv": len(test_csvs),
+            "n_syn_files": len(syn_files),
+            "syn_files": [os.path.basename(f) for f in syn_files],
             "train_files": [os.path.basename(f) for f in train_files],
             "test_files": [os.path.basename(f) for f in test_files],
             "test_windows": t_win,
@@ -482,9 +759,29 @@ def prepare(args) -> None:
         }
 
         if train_files:
+            # build_pairs_for_files keys every pair by series_id = the file's BASENAME, so
+            # two files sharing a basename would collapse into one series (and one file id).
+            # Top-level + syn_data discovery makes that impossible today; assert it anyway,
+            # because the file-level sampler and series_meta both silently depend on it.
+            bases = [os.path.basename(f) for f in train_files]
+            if len(set(bases)) != len(bases):
+                dups = sorted({b for b in bases if bases.count(b) > 1})
+                raise SystemExit(
+                    f"{ds}: duplicate basenames among the train files ({dups}). series_id "
+                    f"is the basename, so these would be merged into one series. Rename or "
+                    f"remove the duplicates."
+                )
+
             train_pairs, _, _, _ = build_pairs_for_files(
                 train_files, args.context_length, args.prediction_length,
                 args.stride, min_req, f"{ds}/train")
+            # Which file each window came from. Capture BEFORE pairs_to_model_inputs drops
+            # series_id (it only keeps it for the test half); the conversion preserves order,
+            # so this indexes train_inputs 1:1.
+            file_names = bases
+            name_to_id = {b: i for i, b in enumerate(file_names)}
+            file_index = np.asarray([name_to_id[p["series_id"]] for p in train_pairs],
+                                    dtype=np.int32)
             train_inputs = pairs_to_model_inputs(train_pairs, include_meta=False)
             del train_pairs
 
@@ -513,11 +810,33 @@ def prepare(args) -> None:
                 pickle.dump(train_inputs, f)
             np.save(os.path.join(ds_out, "train_n_anom.npy"), n_anom)
 
+            # ── File identity + dissimilarity weights (the sampler's optional level) ──
+            # Always emitted, even when no run uses them: they are cheap, and writing them
+            # unconditionally means --file_diversity_datasets can be flipped on an existing
+            # prepared_total without a re-prep.
+            np.save(os.path.join(ds_out, "train_file_index.npy"), file_index)
+            fw = build_file_weights(train_inputs, file_index, file_names, args)
+            with open(os.path.join(ds_out, "train_files.json"), "w") as f:
+                json.dump(fw, f, indent=2)
+
+            if fw["n_files"] > 1:
+                order = np.argsort(fw["weights"])[::-1]
+                top = "  ".join(f"{fw['files'][i].replace('_test.csv', '')}="
+                                f"{100.0 * fw['weights'][i]:.1f}%" for i in order[:3])
+                bot = "  ".join(f"{fw['files'][i].replace('_test.csv', '')}="
+                                f"{100.0 * fw['weights'][i]:.1f}%" for i in order[-2:])
+                logger.info(
+                    f"  FILES -> {fw['n_files']} files, ESS {fw['ess']:.1f} "
+                    f"(uniform would be {fw['n_files']}); heaviest: {top} | lightest: {bot}"
+                )
+
             exp_frac, nat_frac = hs_expected_anom_step_frac(
                 n_anom, args.prediction_length, args.p_anom)
             mean_anom_steps = float(n_anom[n_anom >= 1].mean())
 
             entry.update({
+                "train_n_files": fw["n_files"],
+                "train_file_ess": fw["ess"],
                 "train_windows": len(train_inputs),
                 "train_anom_windows": n_anom_win,
                 "train_norm_windows": n_norm_win,
@@ -541,7 +860,7 @@ def prepare(args) -> None:
                 f"F={entry['channels']}, anomaly steps {100.0 * nat_frac:.1f}% natural "
                 f"-> {100.0 * exp_frac:.1f}% under HS (p_anom={args.p_anom:.3f})"
             )
-            del train_inputs, n_anom
+            del train_inputs, n_anom, file_index
 
             # ── VAL half — mTSBench's own *val.csv, per-series prefix ────────
             # Only train-pool datasets get one: the val set exists to track the
@@ -570,6 +889,16 @@ def prepare(args) -> None:
                 f"({100.0 * grand_anom_steps / max(1, grand_total_steps):.1f}% natural)")
     logger.info(f"  under HS each dataset is drawn {100.0 / max(1, len(train_datasets)):.1f}% "
                 f"of the time regardless of size")
+    syn_pool = [ds for ds in train_datasets
+                if manifest["datasets"][ds].get("n_syn_files", 0) > 0]
+    if syn_pool:
+        logger.info(f"  synthetic (TRAIN only, never test/val): {syn_pool}")
+        only_syn = [ds for ds in syn_pool if manifest["datasets"][ds]["mode"].startswith("test_only")]
+        if only_syn:
+            logger.info(f"  of which trainable ONLY because of syn_data: {only_syn}")
+    elif args.use_syn_data:
+        logger.warning(f"  --use_syn_data given but no <DATASET>/{args.syn_dir}/*test.csv "
+                       f"was found under {args.data_root}. Nothing synthetic was added.")
     logger.info(f"  per-window target: [{NORMAL_SIGNAL_LENGTH} normal | {args.context_length} "
                 f"context | {args.prediction_length} future]; F varies per dataset")
 
@@ -622,6 +951,33 @@ def main():
     p.add_argument("--seed", type=int, default=42)
 
     # Evaluation reuse: symlink the (byte-identical) test halves instead of re-carving.
+    # Synthetic data — TRAIN ONLY, opt-in. Default OFF so the previous experiment
+    # reproduces exactly.
+    p.add_argument("--use_syn_data", action="store_true",
+                   help="Append <DATASET>/<syn_dir>/*test.csv to the dataset's TRAIN half. "
+                        "Synthetic files never enter the test half or the val set. This is "
+                        "what lets the 7 one-file datasets (CalIt2, creditcard, GECCO, "
+                        "Genesis, metro, PSM, swan) join the train pool: level 1 grows from "
+                        "12 to 19 groups, each drawn 5.3%% of the time instead of 8.3%%. "
+                        "Their real *test.csv stays their whole test half, so evaluation is "
+                        "unchanged. OFF by default.")
+    p.add_argument("--syn_dir", default="syn_data",
+                   help="Sub-directory of each dataset holding its synthetic *test.csv.")
+
+    # Per-file dissimilarity weights (consumed by the sampler's optional file level).
+    p.add_argument("--file_weight_alpha", type=float, default=1.0,
+                   help="Exponent on the inverse kernel density: w_f ∝ (1 + density_f)^-alpha. "
+                        "0 = uniform over files (already a big change from level 3's count "
+                        "weighting, which the longest files dominate — the natural ablation "
+                        "baseline); 1 = full dissimilarity tilt. Higher = more aggressive.")
+    p.add_argument("--file_weight_cap", type=float, default=5.0,
+                   help="Bound any single file at cap x (and 1/cap x) the uniform weight 1/n, "
+                        "so one unusual file cannot monopolise its dataset's draws. <=1 to "
+                        "disable clipping.")
+    p.add_argument("--file_feat_max_windows", type=int, default=200,
+                   help="Windows subsampled per file when computing its signature. The "
+                        "descriptor is 22 numbers; 200 windows (12.8k steps) is ample.")
+
     p.add_argument("--link_test_from", default=None,
                    help="Path to an existing prepared_total whose per_dataset/<DS>/"
                         "test_*.pkl should be SYMLINKED instead of regenerated. Makes "

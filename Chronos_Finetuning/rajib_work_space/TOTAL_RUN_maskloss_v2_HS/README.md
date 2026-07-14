@@ -7,6 +7,7 @@ data with **one** mechanism, at **train time**, with **no threshold and nothing 
 |---|---|---|
 | **Dataset** (MITDB+SVDB are ~88% of raw windows) | **runtime** | HS **level 1**: draw a dataset uniformly |
 | **Class** (anomaly *steps* are ~17% of forecast steps) | **runtime** | HS **levels 2–3**: draw a kind (`P_ANOM`), then count-weight windows within that dataset |
+| **File** (a dataset's longest recordings supply most of its windows) | **runtime**, *opt-in* | HS **level 1.5**: draw a source `*test.csv` from its dissimilarity weight — `FILE_DIVERSITY_DATASETS` |
 
 Prep does nothing but carve windows. Every train window of every dataset is kept.
 
@@ -15,11 +16,18 @@ Prep does nothing but carve windows. Every train window of every dataset is kept
 Each window in a train batch is drawn in three independent levels:
 
 ```
-level 1   k    ~ Uniform(K)                       K = 12 train datasets
+level 1   k    ~ Uniform(K)                       K = 12 train datasets (19 with USE_SYN_DATA=1)
 level 2   kind ~ Bernoulli(p_anom = 1/3)          2:1 normal:anomalous, per dataset
 level 3   i    ~ Categorical over dataset k's windows, weight
                     n_anom_i           if kind == anomalous
                     64 - n_anom_i      if kind == normal
+```
+
+…plus an **optional level 1.5**, off by default (see *The file level* below):
+
+```
+level 1.5 f    ~ Categorical over dataset k's FILES, weight w_f   (dissimilarity)
+level 3   i    ~ as above, but scoped to the windows of file f
 ```
 
 Equivalently, the per-draw marginal within the chosen dataset is
@@ -93,6 +101,94 @@ real pool (uniform target 8.33%):
 | room-occupancy | 0.03% | 8.27% | 0.99× |
 
 A pool that is 88% ECG is drawn from as though it were 16.7% ECG.
+
+## The file level (level 1.5) — `FILE_DIVERSITY_DATASETS`, opt-in
+
+Level 1 balances *datasets* and levels 2–3 balance *classes*, but nothing balances **files**.
+A dataset's train pool is the union of many `*test.csv` files, and level 3's count weighting
+cannot see which file a window came from — so a dataset's budget is spent in proportion to
+raw *minutes of recording*. SVDB's 39 ECG records are largely near-duplicates of each other,
+and its longest ones therefore supply most of its draws while a short, differently-shaped
+recording is effectively never trained on. That is a pattern the model never learns.
+
+Level 1.5 draws the **file first**, from a dissimilarity weight `w_f`, and only then the kind
+and the window:
+
+```
+FILE_DIVERSITY_DATASETS="MITDB SVDB" bash run_finetune_total.sh   # those two only
+FILE_DIVERSITY_DATASETS=all          bash run_finetune_total.sh   # every multi-file dataset
+```
+
+Datasets not named keep the **exact** 3-level path, so a file-level run stays a one-variable
+ablation against a 3-level one. Two design points worth knowing:
+
+**File before kind, not after.** The `P_ANOM` class balance is preserved *inside* whichever
+file is chosen, so level 1.5 does not disturb the anomaly-step fraction (measured: 27.4% →
+26.4% on a synthetic 3-file dataset while the largest file's draw share fell from 90.3% to
+20.3%). The two branches carry separate file weights, so a file with no anomaly window has
+weight 0 in the anomalous branch and is unreachable there — the same self-gating as level 3,
+one level up. (Verified: 0 anomalous draws from an anomaly-free file, which still receives
+33.7% of that dataset's draws overall via the normal branch.)
+
+**The weights are computed at prep**, into `per_dataset/<DS>/train_files.json`, so this flag
+can be flipped without a re-prep. Each file gets a 22-number signature — per-channel mean,
+std, skew, kurtosis, ACF(1/10/50), roughness and spectral entropy, pooled by mean and std
+across channels (hence channel-count agnostic), plus its anomaly rate, segment rate and mean
+segment length. After a robust (median/IQR) standardization across the dataset's files,
+
+```
+w_f  ∝  (1 + Σ_{g≠f} exp(−d²_fg / 2σ²))^(−alpha)          σ = median pairwise distance
+```
+
+i.e. **inverse kernel density**, clipped to `FILE_WEIGHT_CAP`× the uniform weight. A file in a
+tight cluster of near-duplicates is down-weighted (its neighbours already explain it); a lone
+unusual file is promoted. Mean *distance* was rejected: one far outlier hijacks it and leaves
+everyone else uniform. Tune at prep with `FILE_WEIGHT_ALPHA` — **0 gives plain
+uniform-over-files**, which is already a large change from count weighting and is the natural
+ablation baseline; 1 (default) adds the dissimilarity tilt.
+
+Real weights, Daphnet (13 train files, ESS 10.9, uniform would be 7.7% each):
+
+| file | windows | share of the dataset's windows (≈ its level-3-only draw share) | draw share with level 1.5 |
+|---|---|---|---|
+| `S06R01E2` | 312 | 5.6% | **17.2%** ← most distinctive |
+| `S01R01E1` | 912 | **16.3%** | 5.8% ← longest, but unremarkable |
+| `S09R01E1` | 128 | 2.3% | 6.0% |
+
+SMD, by contrast, has 9 homogeneous machines: ESS 8.85 of 9, weights within 10.0–14.9%. The
+file level correctly does almost nothing there — which is the check that it is measuring
+dissimilarity rather than manufacturing it.
+
+## Synthetic data — `USE_SYN_DATA=1`, TRAIN only
+
+Seven datasets (CalIt2, creditcard, GECCO, Genesis, metro, PSM, swan) ship exactly one
+`*test.csv`, so the 50/50 file split has nothing to split: they are test-only and invisible to
+level 1. Synthetic files generated for them live in `<DATA_ROOT>/<DATASET>/syn_data/*test.csv`.
+
+`USE_SYN_DATA=1 ./run_prepare_total.sh` appends those files to the dataset's **train half and
+nowhere else** — never the test half (evaluation stays real), never the val set (that is the
+dataset's own `*val.csv`). So the real `*test.csv` of a one-file dataset remains its complete,
+unchanged test half, `LINK_TEST_FROM` still holds and `forward.py`'s numbers stay comparable —
+while the dataset finally joins the train pool. Consequences to keep in mind:
+
+* **K grows 12 → 19.** Level 1 is uniform, so every dataset's draw share drops 8.3% → 5.3%.
+* **The val set changes.** Those 7 datasets now contribute val windows from their `*val.csv`,
+  so `eval_loss` is **not** comparable across this flag.
+* **No dataset is held out any more.** All 19 are trained on. If you want a zero-shot
+  generalization signal, hold one out explicitly with `--datasets`.
+
+Default is **off**, so the previous experiment reproduces exactly.
+
+### One historical bug this fixed
+
+Real `*test.csv` files are now discovered at the dataset's **top level only**. The previous
+recursive glob also swept in `Exathlon/data_not_used/` — three byte-identical copies of real
+Exathlon files, absent from upstream `PLAN-Lab/mTSBench` — which put
+`Exathlon_1_5_1000000_86_test.csv` in the train half **and** the test half simultaneously, in
+this arm and in every arm before it. Dropping the folder re-seeds Exathlon's file split, so its
+test half moves: `_link_or_build_test()` compares the split against the source manifest and
+**re-carves Exathlon rather than linking a stale test half**. Exathlon's forward numbers are
+therefore not comparable with runs from before this fix. Every other dataset is untouched.
 
 ## Why this exists (vs the neighbouring dirs)
 

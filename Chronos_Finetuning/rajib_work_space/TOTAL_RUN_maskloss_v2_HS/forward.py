@@ -45,6 +45,7 @@ import argparse
 import os
 import pickle
 from collections import defaultdict
+import time
 
 import numpy as np
 from tqdm import tqdm
@@ -170,7 +171,7 @@ def main():
     from chronos.chronos2 import Chronos2Pipeline
     from transformers.utils.peft_utils import find_adapter_config_file
     from VUS_ROC_VUS_PR.metrics import get_metrics
-
+    print(f"start time -----> {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
     # ── Load data ────────────────────────────────────────────────────────────
     with open(args.test_pkl, "rb") as f:
         windows = pickle.load(f)
@@ -310,6 +311,7 @@ def main():
         print(f"\nPer-series results written to {args.out_csv}")
     except Exception as e:
         print(f"(could not write csv: {e})")
+    print(f"Done. End time -----> {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
 
 
 if __name__ == "__main__":

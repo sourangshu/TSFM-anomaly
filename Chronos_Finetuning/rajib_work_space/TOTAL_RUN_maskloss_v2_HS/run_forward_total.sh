@@ -30,7 +30,7 @@ PER_DATASET_DIR="${PREPARED_DIR}/per_dataset"
 
 # Fine-tuned by default; set CHECKPOINT="" for the zero-shot baseline. Results dir
 # is auto-tagged FT vs ZS so the two never overwrite each other.
-CHECKPOINT="${CHECKPOINT:-${SCRIPT_DIR}/chronos2-single-stage_mtsbench_maskLossv2_HS_v1/finetuned-ckpt}"
+CHECKPOINT="${CHECKPOINT:-${SCRIPT_DIR}/chronos2-single-stage_mtsbench_maskLossv2_HS_val_v2/finetuned-ckpt}"
 if [ -n "${CHECKPOINT}" ]; then _TAG=FT; else _TAG=ZS; fi
 RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results_${_TAG}}"
 mkdir -p "${RESULTS_DIR}"

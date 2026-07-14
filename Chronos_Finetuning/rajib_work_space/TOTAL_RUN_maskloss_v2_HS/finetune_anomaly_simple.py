@@ -143,6 +143,30 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
     # before pipeline.fit() builds the dataset.
     p_anom: float = 1.0 / 3.0
 
+    # ── OPTIONAL FILE LEVEL (level 1.5) ──────────────────────────────────────
+    # Datasets named here get a FILE draw inserted between the dataset draw and the
+    # kind draw; every other dataset keeps the exact 3-level path, so switching this
+    # on stays a one-variable change.
+    #
+    #     level 1    dataset ~ Uniform(K)
+    #     level 1.5  file    ~ Categorical(w_f)     <- dissimilarity-weighted, HERE
+    #     level 2    kind    ~ Bernoulli(p_anom)
+    #     level 3    window  ~ count-weighted within (dataset, file, kind)
+    #
+    # Why: a dataset's windows come from many *test.csv files that are often near
+    # duplicates (SVDB: 39 ECG records), and level 3's count weighting cannot see which
+    # file a window came from — so the longest files supply most draws and a rare,
+    # differently-shaped recording is effectively never trained on. Drawing the file
+    # first, with weights from prepare_total.py's inverse-density signature, spends the
+    # dataset's budget across its distinct PATTERNS instead of across its raw minutes.
+    #
+    # File before kind (not after) on purpose: it keeps the p_anom class balance intact
+    # inside whichever file is chosen. The two branches carry separate file weights —
+    # a file with no anomaly window simply has weight 0 in the anomalous branch and so
+    # can never be drawn for it, which is the same self-gating idea as level 3.
+    file_diversity: set = frozenset()          # dataset names using the file level
+    file_weights: dict = {}                    # ds -> {file basename: weight}
+
     @staticmethod
     def _cum_from_weights(w: np.ndarray):
         """Normalized cumulative distribution for O(log N) inverse-CDF draws.
@@ -163,12 +187,15 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
         future_types = [int(fl.sum() >= 1) for fl in future_labels]
         # Level-1 grouping key, attached by load_train_pool() from the pkl's folder name.
         ds_names = [str(d.get("dataset", "_pool_")) for d in inputs]
-        # Strip ALL THREE of our extra keys before the parent's validation:
+        # Level-1.5 grouping key: the source *test.csv basename, attached by
+        # load_train_pool() from train_file_index.npy. Empty when the prep predates it.
+        file_names = [str(d.get("file", "")) for d in inputs]
+        # Strip ALL FOUR of our extra keys before the parent's validation:
         # `future_type` (window-level label), `future_labels` (per-timestep array),
-        # and `dataset` (level-1 group id).
+        # `dataset` (level-1 group id) and `file` (level-1.5 group id).
         cleaned = [
             {k: v for k, v in d.items()
-             if k not in ("future_type", "future_labels", "dataset")}
+             if k not in ("future_type", "future_labels", "dataset", "file")}
             for d in inputs
         ]
         super().__init__(cleaned, *args, **kwargs)
@@ -199,8 +226,9 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
         self._n_ds = len(self._ds_names)
 
         # ── Level 3: per-dataset cumulative distributions (normal / anomalous) ───
-        # _groups[k] = (member_indices, cum_normal, cum_anomalous)
+        # _groups[k] = (member_indices, cum_normal, cum_anomalous, file_level or None)
         self._groups = []
+        self._file_ds = []                       # names actually using the file level
         exp_fracs = []
         for k, name in enumerate(self._ds_names):
             members = np.flatnonzero(ds_of_window == k)
@@ -229,13 +257,23 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
             if cum_a is None:
                 raise RuntimeError(f"[hs] dataset '{name}' has no drawable windows.")
 
-            self._groups.append((members, cum_n, cum_a))
-
             # Expected anomaly steps per draw from this dataset, under the level-2/3
             # mixture:  p*E[n_anom | anom branch] + (1-p)*E[n_anom | normal branch].
-            s_a, s_n = n_a.sum(), n_n.sum()
-            e_a = float((n_a * n_a).sum() / s_a) if s_a > 0 else 0.0
-            e_n = float((n_n * n_a).sum() / s_n) if s_n > 0 else 0.0
+            fl = None
+            if name in type(self).file_diversity:
+                fl = self._build_file_level(name, members, n_a, n_n,
+                                            [file_names[i] for i in members])
+            if fl is None:
+                s_a, s_n = n_a.sum(), n_n.sum()
+                e_a = float((n_a * n_a).sum() / s_a) if s_a > 0 else 0.0
+                e_n = float((n_n * n_a).sum() / s_n) if s_n > 0 else 0.0
+            else:
+                # Same expectation, but the file draw reweights which windows are reachable:
+                # E[.] = sum over files of w_f * E[. | that file].
+                e_a, e_n = fl["e_a"], fl["e_n"]
+                self._file_ds.append(name)
+
+            self._groups.append((members, cum_n, cum_a, fl))
             exp_fracs.append((self._p_anom * e_a + (1.0 - self._p_anom) * e_n) / self._H)
 
         # Level 1 is uniform, so the pool-wide expectation is the mean of the per-dataset ones.
@@ -256,14 +294,26 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
             f"(n_anom / {self._H}-n_anom). Expected anomaly-step fraction per draw: "
             f"{100.0 * self._exp_frac:.1f}% (natural {100.0 * baseline:.1f}%)."
         )
+        if self._file_ds:
+            logger.info(
+                f"[hs] level1.5 (FILE) is ON for {len(self._file_ds)} dataset(s): "
+                f"{self._file_ds}. For these, a source *test.csv is drawn from the "
+                f"dissimilarity weights BEFORE the kind draw, so near-duplicate files share "
+                f"one file's worth of budget and rare recordings are reachable. Every other "
+                f"dataset keeps the 3-level path."
+            )
+        else:
+            logger.info("[hs] level1.5 (FILE) is OFF for every dataset "
+                        "(--file_diversity_datasets not set) — pure 3-level sampling.")
         for k, name in enumerate(self._ds_names):
-            members = self._groups[k][0]
+            members, _, _, fl = self._groups[k]
             n_a = self._n_anom[members]
+            tag = f"  [FILE x{len(fl['files'])}]" if fl is not None else ""
             logger.info(
                 f"[hs]   {name:<16s} {len(members):>7d} windows  "
                 f"{int((n_a >= 1).sum()):>6d} anomaly-bearing  "
                 f"natural {100.0 * n_a.mean() / self._H:>5.1f}%  ->  "
-                f"HS {100.0 * exp_fracs[k]:>5.1f}%"
+                f"HS {100.0 * exp_fracs[k]:>5.1f}%{tag}"
             )
 
         # Running realized-balance monitor (logged periodically from the sampler).
@@ -272,16 +322,111 @@ class AnomalyChronos2Dataset(Chronos2Dataset):
         self._seen_total_steps = 0
         self._seen_ds_draws = np.zeros(self._n_ds, dtype=np.int64)
 
+    def _build_file_level(self, name, members, n_a, n_n, member_files):
+        """Level 1.5 for ONE dataset: per-branch file distributions. None = not usable.
+
+        Returns, for each branch, a cumulative distribution over that dataset's FILES
+        (from prepare_total.py's dissimilarity weights, restricted to the files the branch
+        can actually serve and renormalized) plus, for each file, the count-weighted
+        cumulative over its own windows — level 3, now scoped to one file.
+
+        A file cannot serve the anomalous branch if none of its windows has an anomaly
+        step; it is dropped from that branch's file distribution and its weight is handed
+        to the files that can. Same self-gating as level 3, one level up."""
+        weights = type(self).file_weights.get(name)
+        if not weights:
+            logger.warning(
+                f"[hs] '{name}' was named in --file_diversity_datasets, but its prepared "
+                f"dir has no train_files.json. Falling back to the 3-level sampler for it. "
+                f"Re-run run_prepare_total.sh to emit the per-file weights."
+            )
+            return None
+        if any(f == "" for f in member_files):
+            logger.warning(
+                f"[hs] '{name}' has windows with no file tag (train_file_index.npy missing "
+                f"or stale). Falling back to the 3-level sampler for it."
+            )
+            return None
+
+        files = sorted(set(member_files))
+        if len(files) < 2:
+            logger.info(f"[hs] '{name}' has a single train file — the file level is a no-op; "
+                        f"using the 3-level sampler for it.")
+            return None
+
+        member_files = np.asarray(member_files)
+        branches = {}
+        for tag, w_win in (("a", n_a), ("n", n_n)):
+            f_w, f_cums, f_members, f_exp = [], [], [], []
+            for fname in files:
+                sel = np.flatnonzero(member_files == fname)      # positions within `members`
+                cum = self._cum_from_weights(w_win[sel])
+                if cum is None:                                  # branch unserviceable here
+                    continue
+                base = float(weights.get(fname, 0.0))
+                if base <= 0.0:
+                    continue
+                f_w.append(base)
+                f_cums.append(cum)
+                f_members.append(members[sel])
+                # E[n_anom | this file, this branch] — the level-3 mixture, scoped to the file
+                s = float(w_win[sel].sum())
+                f_exp.append(float((w_win[sel] * n_a[sel]).sum() / s) if s > 0 else 0.0)
+
+            if not f_w:
+                logger.warning(
+                    f"[hs] '{name}': no file can serve the "
+                    f"{'anomalous' if tag == 'a' else 'normal'} branch. Falling back to the "
+                    f"3-level sampler for this dataset."
+                )
+                return None
+
+            f_w = np.asarray(f_w, dtype=np.float64)
+            f_w /= f_w.sum()                                     # renormalize over the survivors
+            file_cum = np.cumsum(f_w)
+            file_cum[-1] = 1.0                                   # fp drift guard
+            branches[tag] = {
+                "file_cum": file_cum,
+                "members": f_members,
+                "cums": f_cums,
+                "w": f_w,
+                "exp": np.asarray(f_exp, dtype=np.float64),
+                "n_files": len(f_w),
+            }
+
+        # E[n_anom per draw | branch] = sum_f w_f * E[n_anom | file f, branch]. The file
+        # weights, not the raw window counts, now decide how much each file contributes.
+        return {
+            "a": branches["a"],
+            "n": branches["n"],
+            "e_a": float(np.dot(branches["a"]["w"], branches["a"]["exp"])),
+            "e_n": float(np.dot(branches["n"]["w"], branches["n"]["exp"])),
+            "files": files,
+        }
+
     def _draw_window(self) -> int:
-        """One hierarchical draw: dataset -> kind -> window. Returns a global index."""
+        """One hierarchical draw: dataset -> [file] -> kind -> window. Global index out."""
         k = np.random.randint(self._n_ds)                        # level 1
-        members, cum_n, cum_a = self._groups[k]
-        cum = cum_a if np.random.random() < self._p_anom else cum_n     # level 2
-        j = int(np.searchsorted(cum, np.random.random(), side="right"))  # level 3
-        if j >= len(members):                                    # fp edge guard
-            j = len(members) - 1
+        members, cum_n, cum_a, fl = self._groups[k]
+        anom_kind = np.random.random() < self._p_anom            # level 2
         self._seen_ds_draws[k] += 1
-        return int(members[j])
+
+        if fl is None:                                           # unchanged 3-level path
+            cum = cum_a if anom_kind else cum_n
+            j = int(np.searchsorted(cum, np.random.random(), side="right"))  # level 3
+            if j >= len(members):                                # fp edge guard
+                j = len(members) - 1
+            return int(members[j])
+
+        br = fl["a"] if anom_kind else fl["n"]
+        f = int(np.searchsorted(br["file_cum"], np.random.random(), side="right"))  # level 1.5
+        if f >= br["n_files"]:
+            f = br["n_files"] - 1
+        f_members, f_cum = br["members"][f], br["cums"][f]
+        j = int(np.searchsorted(f_cum, np.random.random(), side="right"))    # level 3
+        if j >= len(f_members):
+            j = len(f_members) - 1
+        return int(f_members[j])
 
     def _generate_train_batches(self):
         """Hierarchically-sampled training batches.
@@ -695,6 +840,17 @@ def parse_args():
                         "uniform and level 3 (window) is count-weighted within the chosen "
                         "dataset by n_anom / (H - n_anom) — thresholdless in both "
                         "branches. Eval is never balanced.")
+    p.add_argument("--file_diversity_datasets", nargs="*", default=None,
+                   metavar="DATASET",
+                   help="Datasets that get the OPTIONAL FILE LEVEL (level 1.5): after the "
+                        "dataset is drawn, one of its source *test.csv files is drawn from "
+                        "the dissimilarity weights in per_dataset/<DS>/train_files.json, and "
+                        "only then the kind and the window. Files that are near duplicates of "
+                        "each other are down-weighted and rare ones promoted, so a dataset's "
+                        "budget is spent across its distinct PATTERNS rather than across its "
+                        "raw minutes (level 3 alone is count-weighted, so the longest files "
+                        "win). Pass 'all', 'none', or explicit names. Datasets not named keep "
+                        "the exact 3-level path. Default: none.")
 
     # Output
     p.add_argument("--output_dir", default="./chronos2-single-stage")
@@ -718,13 +874,18 @@ def load_data(path: str, label: str) -> list[dict]:
     return data
 
 
-def load_train_pool(data_dir: str, debug_per_dataset: int = 0) -> list[dict]:
-    """Load the per-dataset train pkls into one flat pool, tagged for level 1.
+def load_train_pool(data_dir: str, debug_per_dataset: int = 0):
+    """Load the per-dataset train pkls into one flat pool. Returns (pool, file_weights).
 
-    Each window gets a `dataset` key = its folder name; AnomalyChronos2Dataset strips
-    the key before Chronos2Dataset's input validation and uses it to build the
-    level-1 groups. Datasets with only one *test.csv are test-only and have no
-    train_model_inputs.pkl — they are skipped here and are invisible to the sampler.
+    Each window gets a `dataset` key = its folder name (the level-1 group) and, when the
+    prep emitted them, a `file` key = the basename of the *test.csv it was carved from
+    (the optional level-1.5 group). AnomalyChronos2Dataset strips both before
+    Chronos2Dataset's input validation. Datasets with no train_model_inputs.pkl are
+    test-only and invisible to the sampler.
+
+    `file_weights` maps dataset -> {file basename: dissimilarity weight}, straight from
+    prepare_total.py's train_files.json. It is loaded for every dataset that has one;
+    --file_diversity_datasets decides which are actually used.
 
     Order is irrelevant (the sampler never scans sequentially), so no shuffle is done.
     """
@@ -739,25 +900,85 @@ def load_train_pool(data_dir: str, debug_per_dataset: int = 0) -> list[dict]:
 
     pool: list[dict] = []
     found = []
+    file_weights: dict[str, dict[str, float]] = {}
     for ds in sorted(os.listdir(per_ds_root)):
-        path = os.path.join(per_ds_root, ds, "train_model_inputs.pkl")
+        ds_dir = os.path.join(per_ds_root, ds)
+        path = os.path.join(ds_dir, "train_model_inputs.pkl")
         if not os.path.exists(path):
             continue                                    # test-only dataset
         with open(path, "rb") as f:
             items = pickle.load(f)
+
+        # Per-window file identity + the per-file weights, both optional: a prepared_total
+        # from before this feature simply has neither, and the 3-level sampler is unaffected.
+        idx_path, json_path = (os.path.join(ds_dir, "train_file_index.npy"),
+                               os.path.join(ds_dir, "train_files.json"))
+        names = None
+        if os.path.exists(idx_path) and os.path.exists(json_path):
+            with open(json_path) as f:
+                meta = json.load(f)
+            file_index = np.load(idx_path)
+            if len(file_index) != len(items):
+                logger.warning(
+                    f"  {ds}: train_file_index.npy has {len(file_index)} entries but the "
+                    f"pkl has {len(items)} windows — stale sidecar, ignoring it. Re-run "
+                    f"run_prepare_total.sh if you want the file level for this dataset."
+                )
+            else:
+                names = [meta["files"][i] for i in file_index]
+                file_weights[ds] = dict(zip(meta["files"], meta["weights"]))
+
         if debug_per_dataset > 0:
             items = items[:debug_per_dataset]
-        for d in items:
+            if names is not None:
+                names = names[:debug_per_dataset]
+
+        for i, d in enumerate(items):
             d["dataset"] = ds
+            if names is not None:
+                d["file"] = names[i]
         pool.extend(items)
         found.append((ds, len(items)))
-        logger.info(f"  {ds:<16s} {len(items):>7d} train windows")
+        n_files = len({*names}) if names is not None else 0
+        logger.info(f"  {ds:<16s} {len(items):>7d} train windows"
+                    + (f"  from {n_files} files" if n_files else "  (no file index)"))
 
     if not found:
         raise FileNotFoundError(f"No train_model_inputs.pkl found under {per_ds_root}")
     logger.info(f"Train pool: {len(pool)} windows across {len(found)} datasets "
                 f"(uncapped, thresholdless)")
-    return pool
+    return pool, file_weights
+
+
+def resolve_file_diversity(requested, file_weights, pool_datasets) -> set:
+    """Turn --file_diversity_datasets into the concrete set of datasets using the file level.
+
+    Accepts nothing / "none" (off — the default), "all", or explicit dataset names. A name
+    that is not in the train pool is a typo the run should not silently ignore: the whole
+    point of the flag is to change which datasets get the file level, and a misspelt one
+    would quietly leave the sampler unchanged."""
+    if not requested:
+        return set()
+    req = {r.strip() for r in requested if r.strip()}
+    lowered = {r.lower() for r in req}
+    if lowered & {"none", "off", ""}:
+        if len(req) > 1:
+            raise SystemExit("--file_diversity_datasets: 'none' cannot be combined with "
+                             f"dataset names (got {sorted(req)}).")
+        return set()
+    if lowered & {"all"}:
+        if len(req) > 1:
+            raise SystemExit("--file_diversity_datasets: 'all' cannot be combined with "
+                             f"dataset names (got {sorted(req)}).")
+        return {ds for ds in pool_datasets if len(file_weights.get(ds, {})) > 1}
+
+    unknown = sorted(req - set(pool_datasets))
+    if unknown:
+        raise SystemExit(
+            f"--file_diversity_datasets: {unknown} not in the train pool "
+            f"{sorted(pool_datasets)}. Use 'all', 'none', or names from that list."
+        )
+    return req
 
 
 
@@ -799,7 +1020,11 @@ def main():
     if args.debug:
         logger.info("DEBUG mode: truncating to the first 50 windows PER DATASET, "
                     "and val/test to the first 50 samples.")
-    train_data = load_train_pool(args.data_dir, debug_per_dataset=50 if args.debug else 0)
+    train_data, file_weights = load_train_pool(
+        args.data_dir, debug_per_dataset=50 if args.debug else 0)
+    pool_datasets = sorted({d["dataset"] for d in train_data})
+    file_diversity = resolve_file_diversity(
+        args.file_diversity_datasets, file_weights, pool_datasets)
 
     val_data = load_data(val_path, "val") if not args.no_validation else None
     # Optional third dataset, evaluated exactly like val (no weight updates).
@@ -877,9 +1102,11 @@ def main():
     # pipeline.fit builds its dataset internally; swap in our subclass so that
     # per-sample future_labels survive into the trainer's compute_loss.
     chronos2_pipeline.Chronos2Dataset = AnomalyChronos2Dataset
-    # Level 2 of the hierarchical sampler. The dataset is instantiated inside
-    # pipeline.fit, so pass it via the class attribute.
+    # Sampler config. The dataset is instantiated inside pipeline.fit, so it can only be
+    # passed via class attributes: level 2's kind probability, and the optional file level.
     AnomalyChronos2Dataset.p_anom = args.p_anom
+    AnomalyChronos2Dataset.file_diversity = file_diversity
+    AnomalyChronos2Dataset.file_weights = file_weights
 
     logger.info(
         f"Single-stage per-step masked training: lr={args.lr}, steps={args.num_steps}, "
