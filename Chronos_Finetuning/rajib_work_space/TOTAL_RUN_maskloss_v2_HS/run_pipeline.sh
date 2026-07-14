@@ -57,29 +57,22 @@ EXP_TAG="fdiv_MSL"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  2. PICK THE STAGES — uncomment ONE block.
+#  2. PICK THE STAGES — uncomment ONE block. Normally leave this alone.
 # ═════════════════════════════════════════════════════════════════════════════
 #
-# ►► READ THIS BEFORE SUBMITTING A SECOND JOB. ◄◄
+# Every job preps its OWN copy of the data (see PREPARED_DIR below), so jobs are fully
+# independent: submit as many as you like, whenever you like, in any order. No shared
+# state, no races, nothing to sequence.
 #
-# PREPARED_DIR is SHARED by every experiment — that is the point, the runs must read
-# identical windows or you are comparing datasets rather than samplers. So exactly ONE
-# job may prep it. If two jobs run prep against the same directory at the same time,
-# they will overwrite each other's pickles and both results are garbage.
-#
-#   FIRST job submitted   -> "full pipeline" (preps the data, then trains, then evaluates)
-#   EVERY job after that  -> "train + evaluate only" (reuses the prepared data)
-#
-# The guard below will refuse to prep over an existing prepared dir anyway, so a mistake
-# here fails loudly instead of silently corrupting a 6-hour run.
+# The other blocks exist only for resuming a job that died partway.
 
-# ── Full pipeline: prep, then fine-tune, then evaluate (the FIRST job) ───────
+# ── Full pipeline: prep, then fine-tune, then evaluate. THE NORMAL CASE. ─────
 STAGES="prep finetune forward"
 
-# ── Train + evaluate only, reusing the already-prepared data (LATER jobs) ────
+# ── Resume: skip prep, reuse this experiment's already-prepared data ─────────
 # STAGES="finetune forward"
 
-# ── Evaluate only, from an existing checkpoint (e.g. a crashed/resumed run) ──
+# ── Resume: evaluate only, from this experiment's existing checkpoint ────────
 # STAGES="forward"
 
 
@@ -87,8 +80,16 @@ STAGES="prep finetune forward"
 #  3. Shared configuration — normally leave alone
 # ═════════════════════════════════════════════════════════════════════════════
 
-# The ONE prepared dir every experiment reads. Do not tag this per experiment.
-PREPARED_DIR="${PREPARED_DIR:-${SCRIPT_DIR}/prepared_total}"
+# Each experiment preps into its OWN directory, tagged like everything else. That costs
+# ~7 GB per experiment (the test halves are symlinks, so they are not duplicated) and buys
+# total independence between jobs.
+#
+# This is safe for the ablation ONLY because prep is deterministic: same DATA_ROOT, same
+# SEED, same geometry -> the same file split and byte-identical windows every time. So two
+# separately-prepped dirs contain the same data, and any difference in the final numbers is
+# the sampler, not the data. The guard below checks that assumption rather than trusting it:
+# if a sibling prepared_total_* was carved with a different config, this job stops.
+PREPARED_DIR="${PREPARED_DIR:-${SCRIPT_DIR}/prepared_total_${EXP_TAG}}"
 
 # Synthetic files -> TRAIN half only, so the 7 one-file datasets (CalIt2, creditcard,
 # GECCO, Genesis, metro, PSM, swan) join the train pool. Their real *test.csv stays their
@@ -131,7 +132,7 @@ mkdir -p "${LOG_DIR}"
 banner "PLAN  —  ${EXP_TAG}"
 echo "  level 1.5 (FILE) on : ${FILE_DIVERSITY_DATASETS:-<none — plain 3-level sampler>}"
 echo "  STAGES              : ${STAGES}"
-echo "  PREPARED_DIR        : ${PREPARED_DIR}   (shared by every experiment)"
+echo "  PREPARED_DIR        : ${PREPARED_DIR}   (this experiment's own copy)"
 echo "  USE_SYN_DATA        : ${USE_SYN_DATA}   (synthetic files -> TRAIN half only)"
 echo "  NO_VALIDATION       : ${NO_VALIDATION}  (from NO_VAL=${NO_VAL})"
 echo "  DEVICE              : ${DEVICE}"
@@ -147,25 +148,24 @@ for st in ${STAGES}; do
     esac
 done
 
-# Refuse to prep over an existing prepared dir. This is the guard against two submitted
-# jobs racing on the same directory — the second one dies here instead of corrupting it.
+# This experiment's prepared dir already exists — don't silently re-carve it (that would
+# throw away hours and, if a fine-tune were reading it, corrupt that run too).
 if has_stage prep && [ -f "${PREPARED_DIR}/manifest.json" ]; then
     echo "" >&2
-    echo "ERROR: ${PREPARED_DIR} is already prepared (manifest.json exists), but 'prep' is" >&2
-    echo "       in STAGES. Refusing to overwrite it — another experiment is probably using" >&2
-    echo "       it right now, and re-carving it underneath a running job corrupts both." >&2
+    echo "ERROR: ${PREPARED_DIR} is already prepared (manifest.json exists)." >&2
+    echo "       Refusing to re-carve it." >&2
     echo "" >&2
-    echo "       If this is a LATER job, switch to the 'train + evaluate only' block:" >&2
+    echo "       To reuse it (e.g. resuming a crashed job), switch to the resume block:" >&2
     echo "           STAGES=\"finetune forward\"" >&2
-    echo "" >&2
-    echo "       If you really do want to re-prep from scratch, delete or rename it first:" >&2
+    echo "       To rebuild from scratch, move it aside first:" >&2
     echo "           mv ${PREPARED_DIR} ${PREPARED_DIR}.old" >&2
     exit 1
 fi
 
-if ! has_stage prep && [ ! -d "${PREPARED_DIR}/per_dataset" ]; then
-    echo "ERROR: ${PREPARED_DIR}/per_dataset does not exist and 'prep' is not in STAGES." >&2
-    echo "       Submit the full-pipeline block first, or point PREPARED_DIR at a prepared dir." >&2
+if ! has_stage prep && [ ! -f "${PREPARED_DIR}/manifest.json" ]; then
+    echo "ERROR: ${PREPARED_DIR}/manifest.json not found and 'prep' is not in STAGES." >&2
+    echo "       manifest.json is written LAST, so its absence means prep never ran or never" >&2
+    echo "       finished. Submit with the full-pipeline block." >&2
     exit 1
 fi
 
@@ -185,6 +185,45 @@ if has_stage prep; then
     NO_VAL="${NO_VAL}" \
         bash "${SCRIPT_DIR}/run_prepare_total.sh" 2>&1 | tee "${LOG_DIR}/1_prep.log"
 fi
+
+# ── Cross-check: every experiment's prepared dir must describe the SAME data ──
+# Per-experiment prepped dirs are only sound because prep is deterministic. If someone
+# changes SEED, DATA_ROOT, USE_SYN_DATA, the geometry — anything — between two submissions,
+# the two experiments quietly end up trained on different windows and the comparison is
+# worthless. prepare_total.py records its full config in manifest.json, so compare this
+# job's against every sibling prepared_total_* and stop if they disagree.
+python - "${PREPARED_DIR}" "${SCRIPT_DIR}" <<'PYCHK'
+import glob, json, os, sys
+mine_dir, root = sys.argv[1], sys.argv[2]
+IGNORE = {"output_dir"}          # differs by construction; nothing else may
+def cfg(p):
+    with open(p) as f:
+        return {k: v for k, v in (json.load(f).get("config") or {}).items() if k not in IGNORE}
+mine_path = os.path.join(mine_dir, "manifest.json")
+if not os.path.exists(mine_path):
+    sys.exit(0)                  # nothing prepped yet (dry run / resume) — nothing to check
+mine, bad = cfg(mine_path), []
+for other_path in sorted(glob.glob(os.path.join(root, "prepared_total_*", "manifest.json"))):
+    if os.path.samefile(os.path.dirname(other_path), mine_dir):
+        continue
+    theirs = cfg(other_path)
+    diff = {k: (mine.get(k), theirs.get(k)) for k in set(mine) | set(theirs)
+            if mine.get(k) != theirs.get(k)}
+    if diff:
+        bad.append((os.path.dirname(other_path), diff))
+if bad:
+    print("\nERROR: this experiment's prepared data was carved with a DIFFERENT config than")
+    print("       a sibling experiment's. They are not comparable — the difference in your")
+    print("       final numbers would be the DATA, not the sampler.\n")
+    for d, diff in bad:
+        print(f"  vs {d}:")
+        for k, (m, t) in sorted(diff.items()):
+            print(f"      {k}: this={m!r}  other={t!r}")
+    print("\n  Re-prep them with identical settings (move the odd one out aside and rerun),")
+    print("  or, if the difference is intentional, delete the stale sibling.")
+    sys.exit(1)
+print(f"  prep config matches all sibling prepared_total_* dirs — experiments are comparable")
+PYCHK
 
 # ── Stage 2: fine-tune ───────────────────────────────────────────────────────
 if has_stage finetune; then
