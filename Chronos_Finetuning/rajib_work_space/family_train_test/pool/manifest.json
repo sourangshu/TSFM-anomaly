@@ -12,6 +12,13 @@
     "p_anom": 0.3333333333333333,
     "min_anom_windows": 50,
     "min_anom_steps_test": 500,
+    "use_syn_data": true,
+    "syn_dir": "syn_data",
+    "file_weight_alpha": 1.0,
+    "file_weight_cap": 5.0,
+    "file_feat_max_windows": 200,
+    "no_val": true,
+    "val_only": false,
     "val_per_dataset": 200,
     "val_stride": 16,
     "val_p_anom": 0.3333333333333333,
@@ -23,7 +30,9 @@
       "train": [
         "MITDB"
       ],
-      "holdout": "SVDB",
+      "holdout": [
+        "SVDB"
+      ],
       "tier": 1,
       "note": "Both 2-lead ECG, F=3, ~13% anomalous, same anomaly semantics (arrhythmic beats). The flagship."
     },
@@ -32,84 +41,107 @@
       "train": [
         "SMAP"
       ],
-      "holdout": "MSL",
+      "holdout": [
+        "MSL"
+      ],
       "tier": 1,
       "note": "Both NASA telemetry. F differs (SMAP 26 / MSL 56); most channels are one-hot command flags."
     },
-    "server": {
-      "family": "Server / cloud metrics",
+    "env_iot": {
+      "family": "Environmental / building IoT",
       "train": [
-        "Exathlon",
-        "SMD"
+        "CalIt2",
+        "GECCO"
       ],
-      "holdout": "PSM",
-      "tier": 1,
-      "note": "Only 3-dataset family. PSM held out: 1 file, anomaly-dense (32%), so VUS-PR is well conditioned."
-    },
-    "activity": {
-      "family": "Human activity",
-      "train": [
-        "Daphnet"
+      "holdout": [
+        "metro",
+        "room-occupancy"
       ],
-      "holdout": "OPPORTUNITY",
-      "tier": 1,
-      "note": "Same sensor modality (body-worn IMU) but DIFFERENT anomaly semantics (freezing-of-gait vs activity transition). A null result here is ambiguous between domain mismatch and label mismatch."
+      "tier": 2,
+      "caveat": "Both held-out sets are anomaly-sparse (metro ~31 anomalous timesteps; room-occupancy small). VUS-PR is noise-dominated -- a bad number does NOT mean transfer failed. CalIt2 in the train pool is itself anomaly-sparse (~138 steps), so its level-3 anomalous branch is thin.",
+      "note": "Weakest grouping: door counts (CalIt2) + water quality (GECCO) -> freeway traffic (metro) + room CO2 (room-occupancy) is 'has sensors', not one domain."
     },
     "industrial": {
       "family": "Industrial process",
       "train": [
         "GHL"
       ],
-      "holdout": "Genesis",
+      "holdout": [
+        "Genesis"
+      ],
       "tier": 2,
       "caveat": "Genesis has ~28 anomalous timesteps TOTAL (0.30% of 9332). VUS-PR is noise-dominated; a bad number does NOT mean transfer failed.",
       "note": "Reverse direction (train on Genesis) is not viable -- far too few anomaly windows."
     },
-    "env_iot": {
-      "family": "Environmental / building IoT",
+    "server": {
+      "family": "Server / cloud metrics",
       "train": [
-        "GECCO",
-        "metro",
-        "room-occupancy"
+        "SMD",
+        "Exathlon"
       ],
-      "holdout": "CalIt2",
-      "tier": 2,
-      "caveat": "CalIt2 test set is 55 windows / ~138 anomalous timesteps; metro in the train pool has ~31. Measured, not estimated.",
-      "note": "Weakest grouping: water quality vs freeway traffic vs room CO2 vs building door counts is 'has sensors', not one domain."
+      "holdout": [
+        "PSM",
+        "cicids"
+      ],
+      "tier": 1,
+      "caveat": "cicids* is a stretch of 'server': it is network intrusion traffic, not host/cloud metrics. Report its row with that asterisk -- a null there may be sub-domain mismatch, not failed transfer. PSM (anomaly-dense, ~32%) is the clean server-family holdout.",
+      "note": "PSM held out: 1 file, well-conditioned VUS-PR. cicids held out: 6 files, network flows."
+    },
+    "activity": {
+      "family": "Human activity",
+      "train": [
+        "Daphnet"
+      ],
+      "holdout": [
+        "OPPORTUNITY"
+      ],
+      "tier": 1,
+      "note": "Same sensor modality (body-worn IMU) but DIFFERENT anomaly semantics (freezing-of-gait vs activity transition). A null result here is ambiguous between domain mismatch and label mismatch."
     }
   },
   "train_pool": [
+    "CalIt2",
     "Daphnet",
     "Exathlon",
     "GECCO",
     "GHL",
     "MITDB",
     "SMAP",
-    "SMD",
-    "metro",
-    "room-occupancy"
+    "SMD"
   ],
   "heldout": [
-    "CalIt2",
     "Genesis",
     "MSL",
     "OPPORTUNITY",
     "PSM",
-    "SVDB"
+    "SVDB",
+    "cicids",
+    "metro",
+    "room-occupancy"
   ],
   "datasets": {
     "CalIt2": {
       "roles": [
-        "test"
+        "train"
       ],
       "n_test_csv": 1,
       "files": [
         "CalIt2_traffic_test.csv"
       ],
-      "test_windows": 55,
-      "test_series": 1,
-      "test_anom_windows": 15,
-      "test_anom_steps": 138
+      "n_syn_files": 4,
+      "syn_files": [
+        "CalIt2_traffic_syn-1_test.csv",
+        "CalIt2_traffic_syn-2_test.csv",
+        "CalIt2_traffic_syn-3_test.csv",
+        "CalIt2_traffic_syn-4_test.csv"
+      ],
+      "train_windows": 275,
+      "train_anom_windows": 81,
+      "train_norm_windows": 194,
+      "train_n_files": 5,
+      "train_file_ess": 4.93,
+      "natural_anom_step_frac": 0.0324,
+      "hs_expected_anom_step_frac": 0.0706
     },
     "Daphnet": {
       "roles": [
@@ -144,25 +176,21 @@
         "Daphnet_S09R01E3_test.csv",
         "Daphnet_S09R01E4_test.csv"
       ],
+      "n_syn_files": 0,
+      "syn_files": [],
       "train_windows": 9378,
       "train_anom_windows": 1513,
       "train_norm_windows": 7865,
+      "train_n_files": 26,
+      "train_file_ess": 22.82,
       "natural_anom_step_frac": 0.1423,
-      "hs_expected_anom_step_frac": 0.3234,
-      "val_file": "Daphnet_S05R01E1_val.csv",
-      "val_windows_available": 208,
-      "val_anom_windows_available": 141,
-      "val_windows": 200,
-      "val_anom_windows": 133,
-      "val_norm_windows": 67,
-      "val_anom_win_frac": 0.665,
-      "val_anom_step_frac": 0.6154
+      "hs_expected_anom_step_frac": 0.3234
     },
     "Exathlon": {
       "roles": [
         "train"
       ],
-      "n_test_csv": 33,
+      "n_test_csv": 30,
       "files": [
         "Exathlon_10_2_1000000_67_test.csv",
         "Exathlon_10_3_1000000_75_test.csv",
@@ -193,24 +221,17 @@
         "Exathlon_9_2_1000000_66_test.csv",
         "Exathlon_9_3_500000_74_test.csv",
         "Exathlon_9_4_1000000_78_test.csv",
-        "Exathlon_9_5_1000000_84_test.csv",
-        "Exathlon_1_2_100000_68_test.csv",
-        "Exathlon_1_5_1000000_86_test.csv",
-        "Exathlon_2_2_200000_69_test.csv"
+        "Exathlon_9_5_1000000_84_test.csv"
       ],
-      "train_windows": 10306,
-      "train_anom_windows": 1277,
-      "train_norm_windows": 9029,
-      "natural_anom_step_frac": 0.1168,
-      "hs_expected_anom_step_frac": 0.3293,
-      "val_file": "Exathlon_4_1_100000_61_val.csv",
-      "val_windows_available": 1579,
-      "val_anom_windows_available": 231,
-      "val_windows": 200,
-      "val_anom_windows": 67,
-      "val_norm_windows": 133,
-      "val_anom_win_frac": 0.335,
-      "val_anom_step_frac": 0.335
+      "n_syn_files": 0,
+      "syn_files": [],
+      "train_windows": 10214,
+      "train_anom_windows": 1223,
+      "train_norm_windows": 8991,
+      "train_n_files": 30,
+      "train_file_ess": 27.45,
+      "natural_anom_step_frac": 0.1127,
+      "hs_expected_anom_step_frac": 0.329
     },
     "GECCO": {
       "roles": [
@@ -220,19 +241,20 @@
       "files": [
         "GECCO_water_quality_test.csv"
       ],
-      "train_windows": 1290,
-      "train_anom_windows": 57,
-      "train_norm_windows": 1233,
-      "natural_anom_step_frac": 0.0155,
-      "hs_expected_anom_step_frac": 0.1791,
-      "val_file": "GECCO_water_quality_val.csv",
-      "val_windows_available": 1696,
-      "val_anom_windows_available": 44,
-      "val_windows": 200,
-      "val_anom_windows": 44,
-      "val_norm_windows": 156,
-      "val_anom_win_frac": 0.22,
-      "val_anom_step_frac": 0.0947
+      "n_syn_files": 4,
+      "syn_files": [
+        "GECCO_water_quality_syn-1_test.csv",
+        "GECCO_water_quality_syn-2_test.csv",
+        "GECCO_water_quality_syn-3_test.csv",
+        "GECCO_water_quality_syn-4_test.csv"
+      ],
+      "train_windows": 6450,
+      "train_anom_windows": 281,
+      "train_norm_windows": 6169,
+      "train_n_files": 5,
+      "train_file_ess": 4.92,
+      "natural_anom_step_frac": 0.0154,
+      "hs_expected_anom_step_frac": 0.1853
     },
     "GHL": {
       "roles": [
@@ -255,19 +277,15 @@
         "GHL_47_Lev_corr_Temp_fault_seed_197_vars_23_test.csv",
         "GHL_48_Lev_corr_Temp_fault_seed_199_vars_23_test.csv"
       ],
+      "n_syn_files": 0,
+      "syn_files": [],
       "train_windows": 17919,
       "train_anom_windows": 267,
       "train_norm_windows": 17652,
+      "train_n_files": 14,
+      "train_file_ess": 12.53,
       "natural_anom_step_frac": 0.0136,
-      "hs_expected_anom_step_frac": 0.3215,
-      "val_file": "GHL_41_Lev_corr_Temp_fault_seed_181_vars_23_val.csv",
-      "val_windows_available": 5340,
-      "val_anom_windows_available": 31,
-      "val_windows": 200,
-      "val_anom_windows": 31,
-      "val_norm_windows": 169,
-      "val_anom_win_frac": 0.155,
-      "val_anom_step_frac": 0.1434
+      "hs_expected_anom_step_frac": 0.3215
     },
     "Genesis": {
       "roles": [
@@ -277,6 +295,8 @@
       "files": [
         "Genesis_test.csv"
       ],
+      "n_syn_files": 0,
+      "syn_files": [],
       "test_windows": 137,
       "test_series": 1,
       "test_anom_windows": 1,
@@ -336,19 +356,15 @@
         "MITDB_233_test.csv",
         "MITDB_234_test.csv"
       ],
+      "n_syn_files": 0,
+      "syn_files": [],
       "train_windows": 381499,
       "train_anom_windows": 56807,
       "train_norm_windows": 324692,
+      "train_n_files": 47,
+      "train_file_ess": 35.18,
       "natural_anom_step_frac": 0.1313,
-      "hs_expected_anom_step_frac": 0.3228,
-      "val_file": "MITDB_200_val.csv",
-      "val_windows_available": 8090,
-      "val_anom_windows_available": 3422,
-      "val_windows": 200,
-      "val_anom_windows": 67,
-      "val_norm_windows": 133,
-      "val_anom_win_frac": 0.335,
-      "val_anom_step_frac": 0.3115
+      "hs_expected_anom_step_frac": 0.3228
     },
     "MSL": {
       "roles": [
@@ -383,6 +399,8 @@
         "MSL_T-5_test.csv",
         "MSL_T-8_test.csv"
       ],
+      "n_syn_files": 0,
+      "syn_files": [],
       "test_windows": 894,
       "test_series": 26,
       "test_anom_windows": 147,
@@ -408,6 +426,8 @@
         "OPPORTUNITY_S4-ADL4_test.csv",
         "OPPORTUNITY_S4-ADL5_test.csv"
       ],
+      "n_syn_files": 0,
+      "syn_files": [],
       "test_windows": 4739,
       "test_series": 13,
       "test_anom_windows": 108,
@@ -421,6 +441,8 @@
       "files": [
         "PSM_test.csv"
       ],
+      "n_syn_files": 0,
+      "syn_files": [],
       "test_windows": 1090,
       "test_series": 1,
       "test_anom_windows": 384,
@@ -484,19 +506,15 @@
         "SMAP_T-2_test.csv",
         "SMAP_T-3_test.csv"
       ],
+      "n_syn_files": 0,
+      "syn_files": [],
       "train_windows": 5947,
       "train_anom_windows": 850,
       "train_norm_windows": 5097,
+      "train_n_files": 51,
+      "train_file_ess": 48.79,
       "natural_anom_step_frac": 0.1336,
-      "hs_expected_anom_step_frac": 0.3275,
-      "val_file": "SMAP_G-7_val.csv",
-      "val_windows_available": 215,
-      "val_anom_windows_available": 10,
-      "val_windows": 200,
-      "val_anom_windows": 10,
-      "val_norm_windows": 190,
-      "val_anom_win_frac": 0.05,
-      "val_anom_step_frac": 0.0316
+      "hs_expected_anom_step_frac": 0.3275
     },
     "SMD": {
       "roles": [
@@ -523,19 +541,15 @@
         "SMD_machine-3-5_test.csv",
         "SMD_machine-3-6_test.csv"
       ],
+      "n_syn_files": 0,
+      "syn_files": [],
       "train_windows": 3857,
       "train_anom_windows": 389,
       "train_norm_windows": 3468,
+      "train_n_files": 18,
+      "train_file_ess": 17.52,
       "natural_anom_step_frac": 0.056,
-      "hs_expected_anom_step_frac": 0.2936,
-      "val_file": "SMD_machine-1-2_val.csv",
-      "val_windows_available": 170,
-      "val_anom_windows_available": 8,
-      "val_windows": 170,
-      "val_anom_windows": 8,
-      "val_norm_windows": 162,
-      "val_anom_win_frac": 0.0471,
-      "val_anom_step_frac": 0.0327
+      "hs_expected_anom_step_frac": 0.2936
     },
     "SVDB": {
       "roles": [
@@ -622,55 +636,63 @@
         "SVDB_893_test.csv",
         "SVDB_894_test.csv"
       ],
+      "n_syn_files": 0,
+      "syn_files": [],
       "test_windows": 223296,
       "test_series": 78,
       "test_anom_windows": 43869,
       "test_anom_steps": 1924782
     },
+    "cicids": {
+      "roles": [
+        "test"
+      ],
+      "n_test_csv": 6,
+      "files": [
+        "cicids_0_test.csv",
+        "cicids_2_test.csv",
+        "cicids_3_test.csv",
+        "cicids_5_test.csv",
+        "cicids_6_test.csv",
+        "cicids_7_test.csv"
+      ],
+      "n_syn_files": 0,
+      "syn_files": [],
+      "test_windows": 20947,
+      "test_series": 6,
+      "test_anom_windows": 8796,
+      "test_anom_steps": 321384
+    },
     "metro": {
       "roles": [
-        "train"
+        "test"
       ],
       "n_test_csv": 1,
       "files": [
         "metro_traffic-volume_test.csv"
       ],
-      "train_windows": 368,
-      "train_anom_windows": 25,
-      "train_norm_windows": 343,
-      "natural_anom_step_frac": 0.0013,
-      "hs_expected_anom_step_frac": 0.0084,
-      "val_file": "metro_traffic-volume_val.csv",
-      "val_windows_available": 1471,
-      "val_anom_windows_available": 108,
-      "val_windows": 200,
-      "val_anom_windows": 67,
-      "val_norm_windows": 133,
-      "val_anom_win_frac": 0.335,
-      "val_anom_step_frac": 0.0057
+      "n_syn_files": 0,
+      "syn_files": [],
+      "test_windows": 368,
+      "test_series": 1,
+      "test_anom_windows": 25,
+      "test_anom_steps": 31
     },
     "room-occupancy": {
       "roles": [
-        "train"
+        "test"
       ],
       "n_test_csv": 2,
       "files": [
         "room-occupancy_1_test.csv",
         "room-occupancy_test.csv"
       ],
-      "train_windows": 206,
-      "train_anom_windows": 50,
-      "train_norm_windows": 156,
-      "natural_anom_step_frac": 0.2052,
-      "hs_expected_anom_step_frac": 0.3207,
-      "val_file": "room-occupancy_val.csv",
-      "val_windows_available": 66,
-      "val_anom_windows_available": 43,
-      "val_windows": 66,
-      "val_anom_windows": 43,
-      "val_norm_windows": 23,
-      "val_anom_win_frac": 0.6515,
-      "val_anom_step_frac": 0.5104
+      "n_syn_files": 0,
+      "syn_files": [],
+      "test_windows": 206,
+      "test_series": 2,
+      "test_anom_windows": 50,
+      "test_anom_steps": 2765
     }
   }
 }

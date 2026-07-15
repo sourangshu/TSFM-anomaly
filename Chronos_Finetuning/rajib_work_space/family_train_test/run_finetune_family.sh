@@ -2,19 +2,20 @@
 # Fine-tune ONE Chronos-2 model on the pooled TRAIN datasets of every family.
 #
 # HIERARCHICAL SAMPLING is used exactly as in TOTAL_RUN_maskloss_v2_HS -- same sampler,
-# same code, same knobs. It needs no reconfiguration here: it discovers its datasets from
+# same code, same knobs, INCLUDING its 1.5 file level. It discovers its datasets from
 # per_dataset/*/train_model_inputs.pkl, so pointing it at the unified pool simply makes
-#   level 1  dataset ~ Uniform(K)          K = 9 train datasets (was 12 there)
-#   level 2  kind    ~ Bernoulli(P_ANOM)   P_ANOM = 1/3, so 2:1 normal:anomalous
-#   level 3  window  ~ count-weighted WITHIN that dataset (n_anom / 64 - n_anom)
-# Every dataset in the pool gets 1/9 of the draws regardless of its size, which is the
-# whole point of HS: MITDB (382k windows) does not drown out room-occupancy (206).
+#   level 1    dataset ~ Uniform(K)          K = 8 train datasets (was 12 there)
+#   level 1.5  file    ~ Categorical(w_f)     multi-file train datasets (FILE_DIVERSITY below)
+#   level 2    kind    ~ Bernoulli(P_ANOM)    P_ANOM = 1/3, so 2:1 normal:anomalous
+#   level 3    window  ~ count-weighted WITHIN (dataset, file, kind)
+# Every dataset in the pool gets 1/8 of the draws regardless of size; level 1.5 then spends
+# each dataset's budget across its distinct PATTERNS rather than its longest recordings.
 #
 # Every hyperparameter below is copied from TOTAL_RUN_maskloss_v2_HS/run_finetune_total.sh
 # unchanged -- per-step masked margin loss, relative margin M=5, LoRA r=32, lr 1e-5,
-# 4000 steps. The ONLY thing this study changes is WHICH datasets are in the pool: nine
-# whole datasets whose family siblings are held out entirely, instead of the train halves
-# of all twelve. One variable.
+# 4000 steps. The variables this study changes are WHICH datasets are in the pool (eight
+# whole datasets whose family siblings are held out entirely) and the 1.5 file level, which
+# defaults ON here (FILE_DIVERSITY_DATASETS=all) as the family method.
 #
 # Usage:
 #   bash run_finetune_family.sh                          # the unified model
@@ -52,7 +53,7 @@ FP16="${FP16:-1}"
 # the TRAIN datasets of THIS fold only (an equal window budget each, ~1/3 anomalous where
 # the val file allows). Held-out datasets contribute no val window, so best-model selection
 # cannot see them. Set to 1 only when the prep ran with NO_VAL=1.
-NO_VALIDATION="${NO_VALIDATION:-0}"
+NO_VALIDATION="${NO_VALIDATION:-1}"
 DEBUG="${DEBUG:-0}"
 
 HINGE_MODE="${HINGE_MODE:-per_step}"
@@ -62,6 +63,24 @@ MARGIN_TAU="${MARGIN_TAU:-6}"
 MARGIN_LAMBDA="${MARGIN_LAMBDA:-1.0}"
 P_ANOM="${P_ANOM:-0.3333333333333333}"
 AGG_MODE="${AGG_MODE:-batch_global}"
+
+# ── Level 1.5 — the dissimilarity-weighted FILE draw ─────────────────────────
+# Names the TRAIN datasets whose draws pass through a FILE level between the dataset
+# draw (level 1) and the kind draw (level 2):
+#   level 1    dataset ~ Uniform(K)
+#   level 1.5  file    ~ Categorical(w_f)     <- only for the datasets named here
+#   level 2    kind    ~ Bernoulli(P_ANOM)
+#   level 3    window  ~ count-weighted within (dataset, file, kind)
+# The weights w_f are the per-file dissimilarity weights written by run_prepare_family.sh
+# (per_dataset/<DS>/train_files.json): a train file that is a near-duplicate of its
+# dataset's other files is down-weighted, a lone unusual one promoted, so the dataset's
+# budget is spent across its distinct PATTERNS rather than its longest recordings.
+#
+# Default "all" = every multi-file train dataset (the family method). Single-file train
+# datasets (CalIt2, GECCO) are skipped automatically -- the file level is a no-op there.
+# Set to "" / "none" for the plain 3-level sampler (the ablation baseline). The symlinked
+# finetune_anomaly_simple.py implements this; it needs the train_file* sidecars in the pool.
+FILE_DIVERSITY_DATASETS="${FILE_DIVERSITY_DATASETS:-all}"
 
 LORA_R="${LORA_R:-32}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
@@ -120,6 +139,7 @@ echo "                      (100% of their *test.csv)"
 echo "  HELD OUT          = ${TEST_DS}"
 echo "                      (zero training windows from these)"
 echo "  HS level 1        = uniform over ${N_TRAIN} datasets"
+echo "  HS level 1.5      = ${FILE_DIVERSITY_DATASETS:-none}  (dissimilarity-weighted file draw)"
 echo "------------------------------------------------------"
 echo "  PREPARED_DIR      = $PREPARED_DIR"
 echo "  OUTPUT_DIR        = $OUTPUT_DIR"
@@ -160,6 +180,11 @@ FINETUNE_ARGS=(
     --p_anom                      "$P_ANOM"
     --agg_mode                    "$AGG_MODE"
 )
+
+# Level 1.5 — unquoted on purpose: the value is a space-separated dataset list (nargs="*").
+# Omitted entirely when empty, so the sampler stays exactly 3-level.
+[ -n "${FILE_DIVERSITY_DATASETS}" ] && \
+    FINETUNE_ARGS+=(--file_diversity_datasets ${FILE_DIVERSITY_DATASETS})
 
 [ -n "${LR}" ] && FINETUNE_ARGS+=(--lr "$LR")
 [ "${NO_VALIDATION}" = "1" ] && FINETUNE_ARGS+=(--no_validation)

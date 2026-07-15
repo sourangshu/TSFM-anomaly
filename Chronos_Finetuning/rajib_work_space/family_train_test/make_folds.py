@@ -5,9 +5,11 @@ Assemble the study's run directory out of the shared pool, using symlinks only.
 ONE model is trained on the pooled training datasets of every family, then evaluated on
 each family's held-out dataset. So there is ONE directory, and it holds both sides:
 
-    run/prepared/per_dataset/<TRAIN_DS>/train_model_inputs.pkl -> pool/...   (x9)
+    run/prepared/per_dataset/<TRAIN_DS>/train_model_inputs.pkl -> pool/...   (x8)
                                         train_n_anom.npy       -> pool/...
-                            /<HELDOUT_DS>/test_model_inputs.pkl -> pool/...  (x6)
+                                        train_file_index.npy   -> pool/...  (level 1.5)
+                                        train_files.json       -> pool/...  (level 1.5)
+                            /<HELDOUT_DS>/test_model_inputs.pkl -> pool/...  (x8)
                                           test_series_meta.pkl  -> pool/...
 
 That single directory drives BOTH stages with no flags, because of how the two
@@ -15,13 +17,13 @@ entrypoints discover data:
 
     finetune_anomaly_simple.py : load_train_pool() walks per_dataset/*/ and SKIPS any
                                  folder without train_model_inputs.pkl
-                                 -> it sees exactly the 9 TRAIN datasets, and the
+                                 -> it sees exactly the 8 TRAIN datasets, and the
                                     hierarchical sampler's level 1 becomes uniform over
-                                    those 9 (identical to TOTAL_RUN_maskloss_v2_HS, which
+                                    those 8 (identical to TOTAL_RUN_maskloss_v2_HS, which
                                     was uniform over its 12).
     forward.py (run_forward)   : walks per_dataset/*/ and SKIPS any folder without
                                  test_model_inputs.pkl
-                                 -> it sees exactly the 6 HELD-OUT datasets.
+                                 -> it sees exactly the 8 HELD-OUT datasets.
 
 Neither stage can touch the other's data, because no dataset carries both artifacts.
 
@@ -43,9 +45,27 @@ import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
+# The level-1.5 sidecars (train_file_index.npy, train_files.json) are NOT linked here:
+# the finetune reads them from the pool via each train dir only if they exist, and they
+# ARE emitted into the pool by prepare_family.py. But make_folds builds a run/ of symlinks,
+# so the finetune opens per_dataset/<DS>/train_model_inputs.pkl (a symlink into the pool)
+# and looks for the two sidecars ALONGSIDE it -- i.e. in the run dir, not the pool. So they
+# must be linked too. Added to TRAIN_ARTIFACTS below.
 TRAIN_ARTIFACTS = ("train_model_inputs.pkl", "train_n_anom.npy")
+# Level-1.5 sidecars: emitted per train dataset by prepare_family.py. OPTIONAL because a
+# pool carved before level 1.5 existed has neither, and the sampler then falls back to the
+# plain 3-level path. They are linked when present so the finetune -- which looks for them
+# in the RUN dir alongside the symlinked train pkl, not by chasing the symlink into the
+# pool -- can actually see them.
+TRAIN_SIDECARS = ("train_file_index.npy", "train_files.json")
 TEST_ARTIFACTS = ("test_model_inputs.pkl", "test_series_meta.pkl")
 VAL_ARTIFACT = "val_model_inputs.pkl"
+
+
+def holdout_list(fam):
+    """A family's holdout as a list. Accepts the historical string form too."""
+    h = fam["holdout"]
+    return list(h) if isinstance(h, (list, tuple)) else [h]
 
 
 def link(src: str, dst: str) -> None:
@@ -111,6 +131,10 @@ def assemble(per_ds_out: str, pool_root: str, train, holdouts) -> None:
         os.makedirs(d, exist_ok=True)
         for a in TRAIN_ARTIFACTS:
             link(os.path.join(pool_root, ds, a), os.path.join(d, a))
+        for a in TRAIN_SIDECARS:                 # level 1.5 — link only if the pool has them
+            src = os.path.join(pool_root, ds, a)
+            if os.path.exists(src):
+                link(src, os.path.join(d, a))
     for ds in holdouts:
         d = os.path.join(per_ds_out, ds)
         os.makedirs(d, exist_ok=True)
@@ -140,7 +164,9 @@ def main():
         for ds in fam["train"]:
             if ds not in train_pool:
                 train_pool.append(ds)
-        holdouts.append(fam["holdout"])
+        for ds in holdout_list(fam):
+            if ds not in holdouts:
+                holdouts.append(ds)
 
     clash = sorted(set(train_pool) & set(holdouts))
     if clash:
@@ -163,15 +189,15 @@ def main():
     for name, fam in fams.items():
         tier = fam.get("tier", 1)
         mark = "" if tier == 1 else "  <- underpowered"
-        print(f"  {name:<13} {'+'.join(fam['train']):<36} {fam['holdout']:<15} "
-              f"{tier}{mark}")
+        print(f"  {name:<13} {'+'.join(fam['train']):<36} "
+              f"{', '.join(holdout_list(fam)):<24} {tier}{mark}")
 
     if args.per_family:
         print("\nPER-FAMILY RUNS  (attribution variant -- one model each)")
         for name, fam in fams.items():
             fam_prepared = os.path.join(args.per_family_dir, name, "prepared")
             assemble(os.path.join(fam_prepared, "per_dataset"),
-                     pool_root, fam["train"], [fam["holdout"]])
+                     pool_root, fam["train"], holdout_list(fam))
             # This fold's val = its own train siblings only, never its holdout.
             build_val(fam_prepared, pool_root, fam["train"], args.seed)
             print(f"  {name:<13} -> {fam_prepared}")

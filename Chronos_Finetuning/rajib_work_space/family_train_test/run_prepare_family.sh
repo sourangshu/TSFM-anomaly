@@ -18,6 +18,7 @@
 #   ./run_prepare_family.sh
 #   ONLY="ecg server" ./run_prepare_family.sh      # subset of families
 #   PER_FAMILY=1 ./run_prepare_family.sh           # + per-family dirs (attribution variant)
+#   USE_SYN_DATA=0 ./run_prepare_family.sh         # real train files only (syn ON by default)
 #   VAL_ONLY=1 ./run_prepare_family.sh             # add the val set to an existing pool
 #                                                  # (train/test pkls left untouched)
 #
@@ -38,13 +39,30 @@ P_ANOM="${P_ANOM:-0.3333333333333333}"
 MIN_ANOM_WINDOWS="${MIN_ANOM_WINDOWS:-50}"
 MIN_ANOM_STEPS_TEST="${MIN_ANOM_STEPS_TEST:-500}"
 
+# Level 1.5 — per-file dissimilarity weights. Always computed and written per TRAIN
+# dataset (train_file_index.npy + train_files.json); run_finetune_family.sh's
+# FILE_DIVERSITY_DATASETS decides which datasets actually route draws through the file
+# level. Writing them here unconditionally means that flag can be flipped without a
+# re-prep. Identical knobs and defaults to TOTAL_RUN_maskloss_v2_HS/run_prepare_total.sh.
+FILE_WEIGHT_ALPHA="${FILE_WEIGHT_ALPHA:-1.0}"        # 0 = uniform over files (ablation baseline)
+FILE_WEIGHT_CAP="${FILE_WEIGHT_CAP:-5.0}"            # no file above 5x / below 1/5x uniform
+FILE_FEAT_MAX_WINDOWS="${FILE_FEAT_MAX_WINDOWS:-200}"
+
+# Synthetic data — TRAIN-role datasets ONLY. Appends <DATASET>/${SYN_DIR}/*test.csv to a
+# train dataset's windows and NOWHERE else: never a held-out dataset's (real) test set,
+# never the val set. Here it turns the two single-file train datasets (CalIt2, GECCO) into
+# multi-file ones, which grows their thin train pools AND activates level 1.5 for them.
+# ON by default; set USE_SYN_DATA=0 to train on real files only.
+USE_SYN_DATA="${USE_SYN_DATA:-1}"
+SYN_DIR="${SYN_DIR:-syn_data}"
+
 # Validation — from mTSBench's own *val.csv (this study otherwise reads *test.csv only),
 # carved for the TRAIN-role datasets ONLY. A held-out dataset gets no val windows: eval_loss
 # selects the checkpoint, so validating on a held-out dataset would leak it into the very
 # transfer number the study reports. Within the train pool the carve is hierarchical: an
 # equal budget per dataset (level 1), a VAL_P_ANOM anomalous share (level 2), n_anom-weighted
 # inside the anomalous kind (level 3). NO_VAL=1 restores the old no-validation behaviour.
-NO_VAL="${NO_VAL:-0}"
+NO_VAL="${NO_VAL:-1}"
 VAL_PER_DATASET="${VAL_PER_DATASET:-200}"
 VAL_STRIDE="${VAL_STRIDE:-16}"        # < STRIDE: small val files can't fill 200 at 64
 VAL_P_ANOM="${VAL_P_ANOM:-0.3333333333333333}"   # match P_ANOM: eval the mix we train on
@@ -56,6 +74,14 @@ echo "Split          : NONE -- whole datasets, 100% of *test.csv, train XOR test
 echo "Context/Pred   : ${CONTEXT_LENGTH} / ${PREDICTION_LENGTH}"
 echo "Stride tr/te   : ${STRIDE} / ${TEST_STRIDE}"
 echo "Balancing      : none at prep -- the HS sampler handles it at train time"
+echo "File weights   : alpha=${FILE_WEIGHT_ALPHA} cap=${FILE_WEIGHT_CAP}x  (level 1.5; per TRAIN"
+echo "                 dataset, used only if run_finetune_family.sh sets FILE_DIVERSITY_DATASETS)"
+if [ "${USE_SYN_DATA}" = "1" ]; then
+echo "Synthetic data : ON  -- <DATASET>/${SYN_DIR}/*test.csv -> TRAIN datasets only"
+echo "                 (never a held-out test set, never val; here CalIt2, GECCO)"
+else
+echo "Synthetic data : off (USE_SYN_DATA=1 to fold ${SYN_DIR}/ into the train datasets)"
+fi
 if [ "${NO_VAL}" = "1" ]; then
 echo "Val set        : none (fine-tune with NO_VALIDATION=1)"
 else
@@ -79,8 +105,13 @@ ARGS=(
     --val_per_dataset     "${VAL_PER_DATASET}"
     --val_stride          "${VAL_STRIDE}"
     --val_p_anom          "${VAL_P_ANOM}"
+    --file_weight_alpha     "${FILE_WEIGHT_ALPHA}"
+    --file_weight_cap       "${FILE_WEIGHT_CAP}"
+    --file_feat_max_windows "${FILE_FEAT_MAX_WINDOWS}"
+    --syn_dir               "${SYN_DIR}"
     --seed                "${SEED}"
 )
+[ "${USE_SYN_DATA}" = "1" ] && ARGS+=(--use_syn_data)
 [ "${NO_VAL}" = "1" ] && ARGS+=(--no_val)
 [ "${VAL_ONLY:-0}" = "1" ] && ARGS+=(--val_only)
 [ -n "${ONLY:-}" ] && ARGS+=(--only ${ONLY})

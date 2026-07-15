@@ -30,6 +30,12 @@ import os
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def holdout_list(fam):
+    """A family's holdout as a list. Accepts the historical string form too."""
+    h = fam["holdout"]
+    return list(h) if isinstance(h, (list, tuple)) else [h]
+
+
 def read_summary(path, metric):
     """-> {dataset: value} for the requested metric."""
     if not os.path.exists(path):
@@ -85,22 +91,24 @@ def main():
 
     rows = []
     for name, fam in fams.items():
-        ds = fam["holdout"]
-        a, b = zs.get(ds), ft.get(ds)
-        delta = (b - a) if isinstance(a, float) and isinstance(b, float) else None
-        rel = (100.0 * delta / a) if isinstance(delta, float) and a else None
         tier = fam.get("tier", 1)
-        rel_s = f"{rel:>+8.1f}%" if isinstance(rel, float) else f"{'-':>9}"
-        print(f"  {name:<13}{ds:<14}{'+'.join(fam['train']):<32}"
-              f"{fmt(a, 10)}{fmt(b, 11)}{fmt(delta, 9)}{rel_s}"
-              f"  {tier}{'' if tier == 1 else '  <- underpowered'}")
-        rows.append({
-            "family": name, "domain": fam.get("family", ""),
-            "held_out": ds, "siblings_in_pool": "+".join(fam["train"]), "tier": tier,
-            f"zeroshot_{args.metric}": a, f"family_ft_{args.metric}": b,
-            "delta": delta,
-            "relative_pct": round(rel, 2) if isinstance(rel, float) else None,
-        })
+        # One row per held-out dataset. A family may hold out more than one (env_iot,
+        # server); each is credited to that family's whole train list as its sibling(s).
+        for ds in holdout_list(fam):
+            a, b = zs.get(ds), ft.get(ds)
+            delta = (b - a) if isinstance(a, float) and isinstance(b, float) else None
+            rel = (100.0 * delta / a) if isinstance(delta, float) and a else None
+            rel_s = f"{rel:>+8.1f}%" if isinstance(rel, float) else f"{'-':>9}"
+            print(f"  {name:<13}{ds:<14}{'+'.join(fam['train']):<32}"
+                  f"{fmt(a, 10)}{fmt(b, 11)}{fmt(delta, 9)}{rel_s}"
+                  f"  {tier}{'' if tier == 1 else '  <- underpowered'}")
+            rows.append({
+                "family": name, "domain": fam.get("family", ""),
+                "held_out": ds, "siblings_in_pool": "+".join(fam["train"]), "tier": tier,
+                f"zeroshot_{args.metric}": a, f"family_ft_{args.metric}": b,
+                "delta": delta,
+                "relative_pct": round(rel, 2) if isinstance(rel, float) else None,
+            })
 
     def macro(subset, label):
         ok = [r for r in subset if isinstance(r["delta"], float)]

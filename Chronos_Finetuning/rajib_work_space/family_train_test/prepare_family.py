@@ -44,10 +44,16 @@ no dataset is ever carved twice):
 
     pool/per_dataset/<DS>/train_model_inputs.pkl   (TRAIN-role datasets)
     pool/per_dataset/<DS>/train_n_anom.npy
+    pool/per_dataset/<DS>/train_file_index.npy     (level 1.5: file each window is from)
+    pool/per_dataset/<DS>/train_files.json         (level 1.5: per-file dissimilarity weights)
     pool/per_dataset/<DS>/val_model_inputs.pkl     (TRAIN-role datasets ONLY)
     pool/per_dataset/<DS>/test_model_inputs.pkl    (TEST-role datasets)
     pool/per_dataset/<DS>/test_series_meta.pkl
     pool/manifest.json
+
+The two train_file* sidecars feed the sampler's OPTIONAL level 1.5 (the dissimilarity-
+weighted file draw): they are always written, and run_finetune_family.sh's
+FILE_DIVERSITY_DATASETS decides which datasets actually use them. See build_file_weights.
 
 make_folds.py concatenates the per-dataset val pkls of a fold's train datasets into
 that fold's prepared/val_model_inputs.pkl — so the unified run validates on its 9
@@ -55,7 +61,7 @@ pool datasets, and a --per_family run validates on that family's siblings only.
 
 Usage:
     python prepare_family.py                       # every dataset named in families.json
-    python prepare_family.py --folds ecg server    # just those folds' datasets
+    python prepare_family.py --only ecg server     # just those families' datasets
     python prepare_family.py --val_only            # add val to an existing pool, leaving
                                                    # train/test pkls untouched
 """
@@ -103,6 +109,182 @@ def hs_expected_anom_step_frac(n_anom: np.ndarray, H: int, p_anom: float):
     e_anom = float((n * n).sum() / s_a)
     e_norm = float((n_norm * n).sum() / s_n)
     return float((p_anom * e_anom + (1.0 - p_anom) * e_norm) / H), natural
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Per-file dissimilarity weights (the sampler's OPTIONAL level 1.5)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Ported VERBATIM from TOTAL_RUN_maskloss_v2_HS/prepare_total.py so the file each
+# window came from, and its per-file dissimilarity weight, are written in exactly the
+# format the (symlinked) finetune_anomaly_simple.py already reads for its level 1.5.
+#
+# Goal: inside one train dataset, stop near-duplicate *test.csv files from dominating
+# and give unusual ones a real chance of being drawn, so training sees the dataset's
+# whole repertoire of patterns rather than its longest recording repeated. Level 3's
+# count weighting is blind to which file a window came from; drawing the FILE first
+# (level 1.5) spends a dataset's budget across its distinct PATTERNS instead of its
+# raw minutes of recording. A no-op on single-file datasets (CalIt2, GECCO here).
+#
+#   1. signature   a fixed-length, channel-count-agnostic descriptor per file
+#   2. standardize robustly across the dataset's files (median / IQR)
+#   3. density     s_f = sum over the OTHER files of a Gaussian kernel on the
+#                  pairwise distance, bandwidth = median pairwise distance
+#   4. weight      w_f  ∝ (1 + s_f)^(-alpha)
+
+_FEAT_NAMES = ("mean", "std", "skew", "kurtosis", "acf1", "acf10", "acf50",
+               "roughness", "spectral_entropy")
+
+
+def _channel_signature(x: np.ndarray) -> np.ndarray:
+    """9 shape descriptors for ONE channel (a 1-D float array)."""
+    x = x[np.isfinite(x)]
+    if x.size < 8:
+        return np.zeros(len(_FEAT_NAMES), dtype=np.float64)
+    mu, sd = float(x.mean()), float(x.std())
+    z = (x - mu) / sd if sd > 1e-12 else np.zeros_like(x)   # shape stats are scale-free
+    skew = float((z ** 3).mean())
+    kurt = float((z ** 4).mean()) - 3.0
+    acfs = []
+    for lag in (1, 10, 50):
+        if z.size > lag + 1:
+            a, b = z[:-lag], z[lag:]
+            denom = float(np.sqrt((a * a).mean() * (b * b).mean()))
+            acfs.append(float((a * b).mean() / denom) if denom > 1e-12 else 0.0)
+        else:
+            acfs.append(0.0)
+    roughness = float(np.abs(np.diff(z)).mean()) if z.size > 1 else 0.0
+    # Spectral entropy of the normalized power spectrum: low = one dominant periodicity,
+    # high = broadband/noisy. Separates e.g. a clean ECG from a bursty server metric.
+    p = np.abs(np.fft.rfft(z - z.mean())) ** 2
+    tot = p.sum()
+    if tot > 1e-12 and p.size > 1:
+        p = p / tot
+        nz = p[p > 0]
+        spec_ent = float(-(nz * np.log(nz)).sum() / np.log(p.size))
+    else:
+        spec_ent = 0.0
+    return np.array([mu, sd, skew, kurt, *acfs, roughness, spec_ent], dtype=np.float64)
+
+
+def file_signature(sig: np.ndarray, labels: np.ndarray, n_windows: int) -> np.ndarray:
+    """One file -> a fixed-length descriptor, independent of its channel count.
+
+    `sig` is (F, T) -- the file's signal, `labels` its (T,) per-step 0/1 ground truth.
+    Per-channel descriptors are pooled by mean AND std across channels, then the file's
+    anomaly profile is appended: anomalies are a pattern to be sampled too, so two files
+    with identical dynamics but different anomaly regimes must not collapse to one point."""
+    per_ch = np.stack([_channel_signature(sig[c]) for c in range(sig.shape[0])])  # (F, 9)
+    pooled = np.concatenate([per_ch.mean(axis=0), per_ch.std(axis=0)])            # (18,)
+
+    lab = np.asarray(labels, dtype=np.int8).ravel()
+    rate = float(lab.mean()) if lab.size else 0.0
+    d = np.diff(np.concatenate([[0], lab, [0]]))
+    starts, ends = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
+    n_seg = len(starts)
+    seg_len = float((ends - starts).mean()) if n_seg else 0.0
+    seg_rate = 1000.0 * n_seg / max(lab.size, 1)          # segments per 1000 steps
+    anom = np.array([rate, seg_rate, np.log1p(seg_len), np.log1p(n_windows)])
+    return np.concatenate([pooled, anom])                                          # (22,)
+
+
+def dissimilarity_weights(feats: np.ndarray, alpha: float, cap: float):
+    """Per-file sampling weights from an inverse kernel density. Returns (w, ess).
+
+    `feats` is (n_files, D). Weights sum to 1. `cap` bounds any file at cap x (and
+    1/cap x) the uniform weight 1/n, so one weird file can never eat the dataset."""
+    n = len(feats)
+    if n <= 1:
+        return np.ones(max(n, 1), dtype=np.float64) / max(n, 1), float(n)
+
+    # Robust standardization: median/IQR, not mean/std. Constant features carry no
+    # information about which files differ and are dropped.
+    med = np.median(feats, axis=0)
+    q75, q25 = np.percentile(feats, 75, axis=0), np.percentile(feats, 25, axis=0)
+    iqr = q75 - q25
+    keep = iqr > 1e-9
+    if not keep.any():                       # every file identical under the signature
+        return np.ones(n) / n, float(n)
+    z = (feats[:, keep] - med[keep]) / iqr[keep]
+    z = np.clip(z, -5.0, 5.0)                # a lone outlier informs, it does not dictate
+
+    d2 = np.maximum(((z[:, None, :] - z[None, :, :]) ** 2).sum(-1), 0.0)
+    off = d2[~np.eye(n, dtype=bool)]
+    sigma2 = float(np.median(off[off > 0])) if (off > 0).any() else 1.0
+    if sigma2 <= 1e-12:
+        sigma2 = 1.0
+
+    kern = np.exp(-d2 / (2.0 * sigma2))
+    np.fill_diagonal(kern, 0.0)
+    density = kern.sum(axis=1)               # how much "company" each file keeps
+
+    w = (1.0 + density) ** (-float(alpha))
+    w = w / w.sum()
+
+    if cap and cap > 1.0:
+        lo, hi = 1.0 / (cap * n), cap / n
+        for _ in range(50):                  # clip + renormalize until it settles
+            w_new = np.clip(w, lo, hi)
+            w_new = w_new / w_new.sum()
+            if np.allclose(w_new, w, atol=1e-9):
+                w = w_new
+                break
+            w = w_new
+
+    ess = float(1.0 / (w ** 2).sum())        # 1 = one file owns everything, n = uniform
+    return w, ess
+
+
+def build_file_weights(train_inputs, file_index, file_names, args):
+    """Signature + weight every train file of one dataset. Returns a JSON-able dict.
+
+    The per-file signal is reconstructed from the windows already in memory -- the train
+    stride equals the prediction length, so consecutive windows' `future` blocks tile the
+    series contiguously and concatenating them replays it. No CSV is re-read. Long files
+    are subsampled to `--file_feat_max_windows` evenly spaced windows.
+
+    The returned dict's 'files' / 'weights' are exactly what the symlinked
+    finetune_anomaly_simple.py's load_train_pool() reads for level 1.5."""
+    H = args.prediction_length
+    feats, per_file = [], []
+    for f, name in enumerate(file_names):
+        idx = np.flatnonzero(file_index == f)
+        if idx.size == 0:                    # file yielded no window (too short)
+            feats.append(np.zeros(22))
+            per_file.append({"file": name, "windows": 0, "anom_windows": 0})
+            continue
+        take = idx
+        if idx.size > args.file_feat_max_windows:
+            take = idx[np.linspace(0, idx.size - 1, args.file_feat_max_windows).astype(int)]
+        sig = np.concatenate([np.asarray(train_inputs[i]["target"])[:, -H:] for i in take],
+                             axis=1).astype(np.float64)
+        lab = np.concatenate([np.asarray(train_inputs[i]["future_labels"]) for i in take])
+        feats.append(file_signature(sig, lab, n_windows=int(idx.size)))
+        n_a = sum(1 for i in idx if int(np.asarray(train_inputs[i]["future_labels"]).sum()) >= 1)
+        per_file.append({"file": name, "windows": int(idx.size), "anom_windows": int(n_a)})
+
+    w, ess = dissimilarity_weights(np.stack(feats), args.file_weight_alpha,
+                                   args.file_weight_cap)
+
+    # A file with no windows cannot be drawn; hand its mass back to the others.
+    live = np.array([e["windows"] > 0 for e in per_file])
+    if live.any() and not live.all():
+        w = np.where(live, w, 0.0)
+        w = w / w.sum()
+        ess = float(1.0 / (w[w > 0] ** 2).sum())
+
+    for e, wi in zip(per_file, w):
+        e["weight"] = round(float(wi), 6)
+    return {
+        "files": list(file_names),
+        "weights": [float(x) for x in w],
+        "per_file": per_file,
+        "n_files": len(file_names),
+        "ess": round(ess, 2),
+        "alpha": args.file_weight_alpha,
+        "cap": args.file_weight_cap,
+        "method": "inverse kernel density over a robust 22-d per-file signature",
+    }
 
 
 def find_val_csv(ddir: str):
@@ -204,6 +386,12 @@ def build_val(ds, ddir, ds_out, args, min_req):
     }
 
 
+def holdout_list(fam):
+    """A family's holdout as a list. Accepts the historical string form too."""
+    h = fam["holdout"]
+    return list(h) if isinstance(h, (list, tuple)) else [h]
+
+
 def load_families(path: str, only):
     with open(path) as f:
         spec = json.load(f)
@@ -215,11 +403,11 @@ def load_families(path: str, only):
         fams = {k: fams[k] for k in only}
 
     for name, f in fams.items():
-        if f["holdout"] in f["train"]:
+        clash = sorted(set(holdout_list(f)) & set(f["train"]))
+        if clash:
             raise SystemExit(
-                f"Family '{name}' lists {f['holdout']} as both a train dataset and the "
-                f"holdout. That leaks: the evaluated dataset would contribute training "
-                f"windows."
+                f"Family '{name}' lists {clash} as both a train dataset and a holdout. "
+                f"That leaks: the evaluated dataset would contribute training windows."
             )
     return fams
 
@@ -236,7 +424,8 @@ def dataset_roles(fams):
     for f in fams.values():
         for ds in f["train"]:
             roles.setdefault(ds, set()).add("train")
-        roles.setdefault(f["holdout"], set()).add("test")
+        for ds in holdout_list(f):
+            roles.setdefault(ds, set()).add("test")
 
     both = sorted(ds for ds, r in roles.items() if len(r) > 1)
     if both:
@@ -248,26 +437,58 @@ def dataset_roles(fams):
     return roles
 
 
+def real_test_csvs(ddir: str):
+    """The dataset's REAL *test.csv files -- TOP LEVEL ONLY, never recursive.
+
+    Non-recursive on purpose (matches TOTAL_RUN_maskloss_v2_HS/prepare_total.py). A
+    recursive glob would sweep in <DATASET>/syn_data/*test.csv as if it were real data,
+    which for a HELD-OUT dataset (metro, Genesis, PSM here) would put synthetic windows
+    into the TEST set -- evaluation must stay 100% real. Synthetic files are discovered
+    separately by syn_test_csvs() and appended to the TRAIN half only."""
+    return sorted(glob.glob(os.path.join(ddir, "*test.csv")))
+
+
+def syn_test_csvs(ddir: str, syn_dir: str):
+    """The dataset's SYNTHETIC *test.csv files (top level of <DATASET>/<syn_dir>/), or [].
+
+    These are appended to the TRAIN half and go nowhere else: never a held-out dataset's
+    test set (evaluation stays real), never the val set (that is the dataset's *val.csv).
+    In this study they matter for the single-file train datasets (CalIt2, GECCO): they
+    turn a 1-file dataset into a multi-file one, which both grows its thin train pool and
+    activates level 1.5 for it (one real recording + several synthetic patterns)."""
+    return sorted(glob.glob(os.path.join(ddir, syn_dir, "*test.csv")))
+
+
 def build_dataset(ds, roles, args, min_req, per_ds_root):
     ddir = os.path.join(args.data_root, ds)
     if not os.path.isdir(ddir):
         raise SystemExit(f"{ds}: no such directory under {args.data_root}")
 
-    # Only *test.csv -- the *train.csv files carry no anomaly labels.
-    files = sorted(glob.glob(os.path.join(ddir, "**", "*test.csv"), recursive=True))
+    # REAL *test.csv only, top level (the *train.csv files carry no anomaly labels, and a
+    # recursive glob would wrongly sweep syn_data/ into the real set -- see real_test_csvs).
+    files = real_test_csvs(ddir)
     if not files:
-        raise SystemExit(f"{ds}: no *test.csv found under {ddir}")
+        raise SystemExit(f"{ds}: no *test.csv found at the top level of {ddir}")
+
+    # Synthetic files join the TRAIN half only. A held-out (test-role) dataset never gets
+    # them: its role builds only a test set, which must stay 100% real.
+    syn_files = (syn_test_csvs(ddir, args.syn_dir)
+                 if (args.use_syn_data and "train" in roles) else [])
 
     ds_out = os.path.join(per_ds_root, ds)
     os.makedirs(ds_out, exist_ok=True)
 
     logger.info("=" * 78)
-    logger.info(f"{ds}: {len(files)} *test.csv, 100% used  [roles: {sorted(roles)}]")
+    logger.info(f"{ds}: {len(files)} real *test.csv"
+                + (f" + {len(syn_files)} synthetic (TRAIN only)" if syn_files else "")
+                + f", 100% used  [roles: {sorted(roles)}]")
 
     entry = {
         "roles": sorted(roles),
         "n_test_csv": len(files),
         "files": [os.path.basename(f) for f in files],
+        "n_syn_files": len(syn_files),
+        "syn_files": [os.path.basename(f) for f in syn_files],
     }
 
     # ── VAL (TRAIN-role datasets only) ───────────────────────────────────────
@@ -281,9 +502,27 @@ def build_dataset(ds, roles, args, min_req, per_ds_root):
         return entry
 
     if "train" in roles:
+        # Real files + (optional) synthetic files, in that order.
+        train_files = list(files) + list(syn_files)
+
+        # build_pairs_for_files keys every pair by series_id = the file's BASENAME, so two
+        # files sharing a basename would collapse into one series (and one file id). The
+        # file-level sampler (level 1.5) indexes by that basename, so assert uniqueness.
+        bases = [os.path.basename(f) for f in train_files]
+        if len(set(bases)) != len(bases):
+            dups = sorted({b for b in bases if bases.count(b) > 1})
+            raise SystemExit(
+                f"{ds}: duplicate basenames among the train files ({dups}). series_id is "
+                f"the basename, so these would be merged into one series. Rename or remove.")
+
         pairs, _, _, _ = build_pairs_for_files(
-            files, args.context_length, args.prediction_length,
+            train_files, args.context_length, args.prediction_length,
             args.stride, min_req, f"{ds}/train")
+        # Which file each window came from. Capture BEFORE pairs_to_model_inputs drops
+        # series_id (it keeps it only for the test half); the conversion preserves order,
+        # so this indexes `inputs` 1:1.
+        name_to_id = {b: i for i, b in enumerate(bases)}
+        file_index = np.asarray([name_to_id[p["series_id"]] for p in pairs], dtype=np.int32)
         inputs = pairs_to_model_inputs(pairs, include_meta=False)
         del pairs
 
@@ -310,11 +549,31 @@ def build_dataset(ds, roles, args, min_req, per_ds_root):
             pickle.dump(inputs, f)
         np.save(os.path.join(ds_out, "train_n_anom.npy"), n_anom)
 
+        # ── Level 1.5 sidecars — file identity + per-file dissimilarity weights ──
+        # Always emitted (cheap), so FILE_DIVERSITY_DATASETS can be flipped at fine-tune
+        # time without a re-prep. The symlinked finetune_anomaly_simple.py reads exactly
+        # train_file_index.npy (which file each window is from) and train_files.json
+        # ('files' + 'weights'). A no-op for single-file datasets: one file, weight 1.
+        np.save(os.path.join(ds_out, "train_file_index.npy"), file_index)
+        fw = build_file_weights(inputs, file_index, bases, args)
+        with open(os.path.join(ds_out, "train_files.json"), "w") as f:
+            json.dump(fw, f, indent=2)
+        if fw["n_files"] > 1:
+            order = np.argsort(fw["weights"])[::-1]
+            top = "  ".join(f"{fw['files'][i].replace('_test.csv', '')}="
+                            f"{100.0 * fw['weights'][i]:.1f}%" for i in order[:3])
+            bot = "  ".join(f"{fw['files'][i].replace('_test.csv', '')}="
+                            f"{100.0 * fw['weights'][i]:.1f}%" for i in order[-2:])
+            logger.info(f"  FILES -> {fw['n_files']} files, ESS {fw['ess']:.1f} "
+                        f"(uniform would be {fw['n_files']}); heaviest: {top} | "
+                        f"lightest: {bot}")
+
         logger.info(f"  TRAIN -> {len(inputs)} windows "
                     f"({n_anom_win} anomalous / {len(inputs) - n_anom_win} normal), "
                     f"anomaly steps: natural {nat_frac:.1%} -> under HS {exp_frac:.1%}")
         entry.update(train_windows=len(inputs), train_anom_windows=n_anom_win,
                      train_norm_windows=len(inputs) - n_anom_win,
+                     train_n_files=fw["n_files"], train_file_ess=fw["ess"],
                      natural_anom_step_frac=round(nat_frac, 4),
                      hs_expected_anom_step_frac=None if np.isnan(exp_frac)
                      else round(exp_frac, 4))
@@ -379,6 +638,29 @@ def main():
                    help="Warn when a TEST set has fewer anomalous timesteps than this "
                         "(VUS-PR becomes noise-dominated).")
 
+    # Synthetic data — TRAIN-role datasets ONLY. Appends <DATASET>/<syn_dir>/*test.csv to
+    # a train dataset's windows; never touches a held-out dataset's (real) test set or the
+    # val set. Here it applies to CalIt2 and GECCO (the two single-file train datasets).
+    p.add_argument("--use_syn_data", action="store_true",
+                   help="Append <DATASET>/<syn_dir>/*test.csv to TRAIN-role datasets. "
+                        "Synthetic files never enter a held-out test set or the val set.")
+    p.add_argument("--syn_dir", default="syn_data",
+                   help="Sub-directory of each dataset holding its synthetic *test.csv.")
+
+    # Level 1.5 — per-file dissimilarity weights (consumed by the sampler's file level).
+    # Always written; --file_diversity_datasets at fine-tune time decides which are used.
+    p.add_argument("--file_weight_alpha", type=float, default=1.0,
+                   help="Exponent on the inverse kernel density: w_f ∝ (1 + density_f)^-alpha. "
+                        "0 = uniform over files (the ablation baseline); 1 = full "
+                        "dissimilarity tilt. Higher = more aggressive.")
+    p.add_argument("--file_weight_cap", type=float, default=5.0,
+                   help="Bound any single train file at cap x (and 1/cap x) the uniform "
+                        "weight 1/n, so one unusual file cannot monopolise its dataset's "
+                        "draws. <=1 disables clipping.")
+    p.add_argument("--file_feat_max_windows", type=int, default=200,
+                   help="Windows subsampled per file when computing its 22-number "
+                        "signature. 200 (12.8k steps) is ample.")
+
     # Validation — mTSBench's own *val.csv, TRAIN-role datasets only.
     p.add_argument("--no_val", action="store_true",
                    help="Skip the val set (then run the fine-tune with NO_VALIDATION=1).")
@@ -438,6 +720,12 @@ def main():
                 f"{len(train_pool)} datasets ({100.0 / len(train_pool):.1f}% of draws each)")
     logger.info(f"Normal-signal prefix: {NORMAL_SIGNAL_LENGTH}  "
                 f"(model context = {NORMAL_SIGNAL_LENGTH + args.context_length})")
+    if args.use_syn_data:
+        logger.info(f"SYN: <DATASET>/{args.syn_dir}/*test.csv appended to TRAIN-role "
+                    f"datasets ONLY (never a held-out test set, never val). Applies where "
+                    f"a train dataset ships syn_data -- here CalIt2, GECCO.")
+    else:
+        logger.info("SYN: off (pass --use_syn_data to fold syn_data/ into train datasets).")
     if args.no_val:
         logger.info("VAL: skipped (--no_val) -> fine-tune with NO_VALIDATION=1")
     else:
