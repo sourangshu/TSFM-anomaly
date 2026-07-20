@@ -97,6 +97,13 @@ def parse_args():
                    help="How many windows to send to predict() per call (progress granularity)")
     p.add_argument("--predict_batch_size", type=int, default=256,
                    help="predict() batch_size (counts SERIES = windows * n_variates)")
+    p.add_argument("--cross_learning", action="store_true",
+                   help="Enable Chronos-2 cross-learning: every task in a predict() batch "
+                        "is assigned the same group id, so windows in the batch attend to "
+                        "one another instead of being forecast independently. NOTE: this "
+                        "makes scores depend on how windows are chunked into batches "
+                        "(--batch_windows / --predict_batch_size), and windows from "
+                        "different series can share a batch. Off by default.")
 
     # Scoring (mirrors the reference script's options)
     p.add_argument("--score_method", default="interval",
@@ -186,6 +193,9 @@ def main():
     print(f"Input layout per window: target[:, {in_lo}:{fut_lo}] "
           f"({'[normal|context]' if args.use_normal_prefix else '[context only]'}, "
           f"len={model_context}); predict {P} steps; compare to target[:, {fut_lo}:{fut_hi}]")
+    if args.cross_learning:
+        print(f"Cross-learning: ENABLED (all tasks in a predict() batch share one group id; "
+              f"batch_windows={args.batch_windows}, predict_batch_size={args.predict_batch_size})")
 
     # ── Load model: fine-tuned checkpoint if given, else zero-shot base ───────
     src = args.checkpoint or args.model_id
@@ -246,7 +256,8 @@ def main():
         inputs = [{"target": w["target"][:, in_lo:fut_lo]} for w in chunk]    # (n_var, model_context)
         preds = pipeline.predict(inputs, prediction_length=P,
                                  context_length=model_context,
-                                 batch_size=args.predict_batch_size)
+                                 batch_size=args.predict_batch_size,
+                                 cross_learning=args.cross_learning)
         for w, pred in zip(chunk, preds):
             pred = np.asarray(pred.float().cpu())            # (n_var, n_quantiles, P)
             q10, q50, q90 = pred[:, qi[0.1], :], pred[:, qi[0.5], :], pred[:, qi[0.9], :]
