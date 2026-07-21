@@ -288,9 +288,29 @@ def main():
         if args.smooth_window > 1:
             y_score = uniform_filter1d(y_score, size=args.smooth_window)
 
+        # A series is scoreable only if its covered region contains BOTH classes.
+        # Every metric here is a ranking metric over positives vs negatives:
+        #   all-normal  -> no positives: PR/ROC undefined (recall denominator 0)
+        #   all-anomaly -> no negatives: ROC undefined (FPR denominator 0), precision
+        #                  is identically 1 at every threshold, so VUS-PR would be a
+        #                  meaningless 1.0
+        # The all-anomaly case additionally CRASHES the VUS implementation rather than
+        # returning a bad number: basic_metrics.range_convers_new() finds anomaly ranges
+        # from np.diff(label) transitions, and an all-ones label has none, so it returns
+        # [] and new_sequence() then does sequence_original[0][0] -> IndexError.
+        # Skipping is therefore the correct behaviour, not a workaround.
+        #
+        # This bites only EVAL_SPLIT=full: the one offender (Exathlon_1_2_100000_68_test.csv,
+        # 1792 covered steps, 100% anomalous) lives in Exathlon's TRAIN half, so the
+        # held-out test split never evaluated it.
         y_true = m["labels"][lo:hi].astype(int)
-        if y_true.sum() == 0:
+        n_pos = int(y_true.sum())
+        if n_pos == 0:
             print(f"  {sid}: no anomalies in covered region, skipping")
+            continue
+        if n_pos == len(y_true):
+            print(f"  {sid}: covered region is 100% anomalous ({n_pos} steps, no normal "
+                  f"points) — metrics undefined, skipping")
             continue
 
         res = get_metrics(y_score, y_true,
