@@ -54,7 +54,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-./prepared_total}"
 # val_model_inputs.pkl changes and eval_loss is NOT comparable across this flag.
 #
 # Default 0 — the old experiment reproduces byte-for-byte (Exathlon aside).
-USE_SYN_DATA="${USE_SYN_DATA:-1}"         # set 1 to use 
+USE_SYN_DATA="${USE_SYN_DATA:-0}"         # set 1 to use 
 SYN_DIR="${SYN_DIR:-syn_data}"
 
 # ── Per-file dissimilarity weights ───────────────────────────────────────────

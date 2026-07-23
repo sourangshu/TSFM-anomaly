@@ -1,0 +1,16 @@
+{
+ "dataset": "room-occupancy",
+ "model": "COPOD",
+ "kind": "unsup",
+ "hp": {
+  "n_jobs": 1
+ },
+ "sliding_window_VUS": 100,
+ "vus_version": "opt",
+ "vus_thre": 250,
+ "skipped": [],
+ "failed": [],
+ "runtime_s": {
+  "room-occupancy_test.csv": 0.6
+ }
+}

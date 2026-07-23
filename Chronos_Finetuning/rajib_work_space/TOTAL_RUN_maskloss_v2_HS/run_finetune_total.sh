@@ -72,14 +72,14 @@ WORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"                  # .../rajib_work_sp
 # across its raw minutes of recording. Datasets NOT listed keep the exact 3-level path.
 
 # ── EXP A: baseline — no file level anywhere (the current, unchanged sampler) ──
-# FILE_DIVERSITY_DATASETS="${FILE_DIVERSITY_DATASETS:-}"
-# EXP_TAG="${EXP_TAG:-base}"
+FILE_DIVERSITY_DATASETS="${FILE_DIVERSITY_DATASETS:-}"
+EXP_TAG="${EXP_TAG:-base}"
 
 # ── EXP B: file level on MSL ONLY ─────────────────────────────────────────────
 # The single-dataset probe. Every other dataset keeps the plain 3-level path, so any
 # change in MSL's forward number is attributable to the file level alone.
-FILE_DIVERSITY_DATASETS="${FILE_DIVERSITY_DATASETS:-MSL}"
-EXP_TAG="${EXP_TAG:-fdiv_MSL}"
+# FILE_DIVERSITY_DATASETS="${FILE_DIVERSITY_DATASETS:-MSL}"
+# EXP_TAG="${EXP_TAG:-fdiv_MSL}"
 
 # ── EXP C: file level on EVERY multi-file dataset ─────────────────────────────
 # 'all' resolves at load time to every dataset in the train pool that has >1 train file
